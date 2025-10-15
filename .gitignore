@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Streamlit cache
+.streamlit/secrets.toml
+.streamlit/**.json
+.streamlit/**.yaml
+
+# SQLite cache
+backlink_cache.sqlite

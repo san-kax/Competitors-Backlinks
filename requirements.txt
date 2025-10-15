@@ -1,0 +1,7 @@
+streamlit>=1.37
+requests>=2.31
+tldextract>=5.1
+pandas>=2.2
+python-dateutil>=2.9
+pydantic>=2.8
+sqlalchemy>=2.0
