@@ -6,6 +6,7 @@ What it does
 - Loads blocklists from 4 Airtable bases (table IDs recommended)
 - Fetches NEW backlinks (last N days) via Ahrefs v3 /site-explorer/all-backlinks
 - Builds/uses a cached set of ALL referring domains to Gambling.com via Ahrefs v3 /site-explorer/refdomains
+  (with robust fallback to all-backlinks aggregated 1_per_domain)
 - Excludes any linking domains that already link to Gambling.com OR appear in the blocklists
 - Exports CSV
 
@@ -21,10 +22,10 @@ AIRTABLE_DOMAIN_FIELD (default "Domain")
 AIRTABLE_GEO_FIELD (optional; not used in comparison but available)
 
 Blocklists:
-BLOCKLIST_BASE_IDS  (comma-separated base IDs)
-BLOCKLIST_TABLE_NAME  (table ID or name; table ID recommended, e.g. "tbliCOQZY9RICLsLP")
-BLOCKLIST_VIEW_ID    (optional view ID; e.g. "viwwatwEcYK8v7KQ4")
-BLOCKLIST_DOMAIN_FIELD (default "Domain")
+BLOCKLIST_BASE_IDS       (comma-separated base IDs)
+BLOCKLIST_TABLE_NAME     (table ID or name; table ID recommended, e.g. "tbliCOQZY9RICLsLP")
+BLOCKLIST_VIEW_ID        (optional view ID; e.g. "viwwatwEcYK8v7KQ4")
+BLOCKLIST_DOMAIN_FIELD   (default "Domain")
 
 Other:
 GAMBLING_DOMAIN (default "gambling.com")
@@ -66,7 +67,7 @@ def url_to_host(url: str) -> str:
         return url
 
 def iso_window_last_n_days(days: int) -> tuple[str, str]:
-    # Inclusive UTC window like your working curl
+    # Inclusive UTC window like the working curl
     end = datetime.now(timezone.utc).replace(microsecond=0)
     start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0)
     s = start.isoformat().replace("+00:00","Z")
@@ -130,13 +131,13 @@ class AirtableClient:
         return sorted(set(rows))
 
 # ----------------------------
-# Ahrefs client (v3)
+# Ahrefs client (v3) — robust refdomains with fallback
 # ----------------------------
 
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
-    ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"  # requires select + where for date window
-    ENDPOINT_REF_DOMAINS = "/site-explorer/refdomains"   # v3 refdomains
+    ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"   # used for new backlinks AND fallback
+    ENDPOINT_REF_DOMAINS = "/site-explorer/refdomains"    # primary for referring domains
 
     def __init__(self, token: str):
         self.session = requests.Session()
@@ -172,14 +173,48 @@ class AhrefsClient:
         return out
 
     def fetch_referring_domains(self, target_domain: str, mode: str = "domain") -> List[str]:
-        rows = self._paginate(self.ENDPOINT_REF_DOMAINS, {
+        """
+        Try v3 /refdomains (with select) first.
+        If that fails (plan/param mismatch), fall back to v3 /all-backlinks aggregated 1_per_domain.
+        """
+        # --- Primary: /refdomains
+        try:
+            rows = self._paginate(self.ENDPOINT_REF_DOMAINS, {
+                "target": target_domain,
+                "mode": mode,
+                "limit": 1000,
+                "select": "refdomain",  # some v3 deployments require a select
+            })
+            out = []
+            for r in rows:
+                host = (
+                    r.get("refdomain") or
+                    r.get("referring_domain") or
+                    r.get("domain") or
+                    r.get("host") or
+                    r.get("url_from")
+                )
+                if host:
+                    out.append(extract_registrable_domain(url_to_host(host)))
+            uniq = sorted({d for d in out if d})
+            if uniq:
+                return uniq
+            # If empty, fall through to fallback.
+        except requests.HTTPError:
+            pass
+
+        # --- Fallback: /all-backlinks aggregated to 1_per_domain
+        rows = self._paginate(self.ENDPOINT_BACKLINKS, {
             "target": target_domain,
             "mode": mode,
             "limit": 1000,
+            "aggregation": "1_per_domain",
+            "select": "root_name_source,url_from",
+            "order_by": "url_rating_source:desc",
         })
-        out: List[str] = []
+        out = []
         for r in rows:
-            host = r.get("referring_domain") or r.get("domain") or r.get("host") or r.get("url_from")
+            host = r.get("root_name_source") or r.get("url_from")
             if host:
                 out.append(extract_registrable_domain(url_to_host(host)))
         return sorted({d for d in out if d})
@@ -199,7 +234,7 @@ class AhrefsClient:
             "select": "url_from,anchor,first_seen_link",
             "order_by": "first_seen_link:desc",
             "where": json.dumps(where_obj),
-            # "aggregation": "1_per_domain",  # uncomment if you want 1 backlink per linking domain
+            # "aggregation": "1_per_domain",  # optional if you want 1 backlink per ref domain
         }
         rows = self._paginate(self.ENDPOINT_BACKLINKS, params)
         out = []
@@ -387,4 +422,4 @@ if refresh_cache:
     else:
         run_pipeline(force_refresh_cache=True)
 
-st.caption("Uses Ahrefs v3: /site-explorer/refdomains and /site-explorer/all-backlinks (with select + where on first_seen_link).")
+st.caption("Uses Ahrefs v3: /site-explorer/refdomains (with select) and /site-explorer/all-backlinks (with select + where on first_seen_link). Fallback ensures a ref-domain set even if /refdomains is restricted on your plan.")
