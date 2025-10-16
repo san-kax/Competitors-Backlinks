@@ -1,11 +1,12 @@
 """
 Streamlit app: Airtable → Ahrefs (last N days backlinks) vs Gambling.com referring domains
 
-- Baseline (Gambling.com): Ahrefs v3 /site-explorer/all-backlinks with history=all_time
-  and aggregation=1_per_domain (schema: root_name_source,url_from)
-- New backlinks: Ahrefs v3 /site-explorer/all-backlinks with 1_per_domain + where window
-  on first_seen_link and last_seen is null
-- Targets sanitized to avoid "bad target" errors
+Secrets (Streamlit → Settings → Secrets) or env:
+- AHREFS_API_TOKEN
+- AIRTABLE_API_KEY
+- AIRTABLE_BASE_ID, AIRTABLE_TABLE, AIRTABLE_VIEW (optional), AIRTABLE_DOMAIN_FIELD
+- BLOCKLIST_BASE_IDS (comma-separated), BLOCKLIST_TABLE_NAME, BLOCKLIST_VIEW_ID (optional), BLOCKLIST_DOMAIN_FIELD
+- GAMBLING_DOMAIN (default "gambling.com")
 """
 
 import os
@@ -70,9 +71,11 @@ def sanitize_target_for_ahrefs(val: str) -> Optional[str]:
     reg = extract_registrable_domain(s)
     return s if reg else None
 
-def merge_unique(a, b):
-    s = set(a or [])
-    s.update(b or [])
+def merge_unique(*lists: List[str]) -> List[str]:
+    s: Set[str] = set()
+    for lst in lists:
+        if lst:
+            s.update(lst)
     return sorted(s)
 
 # ----------------------------
@@ -125,7 +128,6 @@ class AirtableClient:
             offset = data.get("offset")
             if not offset or len(rows) >= max_records:
                 break
-
         return sorted(set(rows))
 
 # ----------------------------
@@ -169,24 +171,35 @@ class AhrefsClient:
                 break
         return out
 
-    # Baseline: all historical referring domains using all-backlinks (1_per_domain)
+    # Baseline: all-time referring domains via /all-backlinks (1_per_domain), robust parsing
     def fetch_referring_domains_alltime(self, target_domain: str, mode: str = "domain") -> List[str]:
         rows = self._paginate(self.ENDPOINT_BACKLINKS, {
             "target": target_domain,
-            "mode": mode,
+            "mode": mode,                # we'll call both domain & subdomains outside
             "limit": 1000,
             "history": "all_time",
             "aggregation": "1_per_domain",
-            "select": "root_name_source,url_from",
+            # deliberately NO 'select' so we don't miss fields on some plans
         })
         out = []
         for r in rows:
-            host = r.get("root_name_source") or r.get("url_from")
-            if host:
-                out.append(extract_registrable_domain(url_to_host(host)))
+            cand = (
+                r.get("root_name_source") or
+                r.get("root_domain") or
+                r.get("referring_domain") or
+                r.get("host")
+            )
+            if not cand:
+                uf = r.get("url_from")
+                if uf:
+                    cand = url_to_host(uf)
+            if cand:
+                reg = extract_registrable_domain(cand)
+                if reg:
+                    out.append(reg)
         return sorted({d for d in out if d})
 
-    # Last N days (new backlinks), de-duped by domain, only currently live
+    # New backlinks (last N days), de-duped by domain, only live links
     def fetch_new_backlinks_last_n_days(self, target_domain: str, days: int = 14, mode: str = "domain") -> List[Dict[str, Any]]:
         start_iso, end_iso = iso_window_last_n_days(days)
         where_obj = {
@@ -217,7 +230,7 @@ class AhrefsClient:
         return out
 
 # ----------------------------
-# Local cache for ref domains
+# Local cache (SQLite)
 # ----------------------------
 
 DB_PATH = "./backlink_cache.sqlite"
@@ -235,8 +248,7 @@ def ensure_db():
         conn.commit()
 
 def save_ref_domains_to_cache(target_domain: str, domains: List[str]):
-    # don't persist empty results
-    if not domains:
+    if not domains:   # don't persist empty results
         return
     ensure_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -294,6 +306,7 @@ with st.sidebar:
     airtable_domain_field = st.text_input("Airtable Domain Field", value=DEFAULT_DOMAIN_FIELD)
     days = st.number_input("Window (days)", min_value=1, max_value=60, value=14)
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
+    show_debug = st.checkbox("Show debug counts", value=False)
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache = st.button("Refresh Gambling.com cache")
     clear_cache_btn = st.button("Clear Gambling.com cache")
@@ -345,25 +358,33 @@ def run_pipeline(force_refresh_cache: bool = False):
     # 3) Gambling.com baseline (cache + fresh if needed)
     st.write("## 3) Gambling.com referring domains (baseline)")
     ah = AhrefsClient(AHREFS_TOKEN)
+
     cache_hit = None if force_refresh_cache else load_ref_domains_from_cache(gambling_domain)
     if cache_hit:
         fetched_at, gdc_ref_domains = cache_hit
         st.write(f"Cache hit: **{len(gdc_ref_domains)}** domains (cached {fetched_at.isoformat()})")
     else:
-        with st.spinner("Fetching baseline ref domains from Ahrefs v3 (all_time, 1_per_domain)…"):
-            # try naked + www, then merge unique
-            t1 = sanitize_target_for_ahrefs(gambling_domain) or "gambling.com"
-            t2 = "www.gambling.com"
-            d1, d2 = [], []
-            try:
-                d1 = ah.fetch_referring_domains_alltime(t1)
-            except requests.HTTPError as e:
-                st.warning(f"Baseline fetch failed for {t1}: {e}")
-            try:
-                d2 = ah.fetch_referring_domains_alltime(t2)
-            except requests.HTTPError as e:
-                st.info(f"Baseline fetch also failed for {t2}: {e}")
-            gdc_ref_domains = merge_unique(d1, d2)
+        with st.spinner("Fetching baseline ref domains (all_time, 1_per_domain)…"):
+            t_naked = sanitize_target_for_ahrefs(gambling_domain) or "gambling.com"
+            t_www   = "www.gambling.com" if "www." not in t_naked else t_naked
+
+            parts, errors = [], []
+            for tgt in {t_naked, t_www}:
+                for md in ("domain", "subdomains"):
+                    try:
+                        part = ah.fetch_referring_domains_alltime(tgt, mode=md)
+                        if show_debug:
+                            st.write(f"• {tgt} [{md}] → {len(part)} domains")
+                        parts.append(part)
+                    except requests.HTTPError as e:
+                        errors.append(f"{tgt} [{md}]: {e}")
+
+            gdc_ref_domains = merge_unique(*parts)
+            if errors:
+                with st.expander("Baseline fetch warnings/errors"):
+                    for e in errors:
+                        st.write("- " + e)
+
             if gdc_ref_domains:
                 save_ref_domains_to_cache(gambling_domain, gdc_ref_domains)
 
@@ -389,6 +410,9 @@ def run_pipeline(force_refresh_cache: bool = False):
         except requests.HTTPError as e:
             st.error(f"Ahrefs v3 error for {target}: {e}")
             rows = []
+
+        if show_debug:
+            st.write(f"{target}: {len(rows)} new backlinks (last {days}d)")
 
         for r in rows:
             src = r.get("source_url")
@@ -430,4 +454,4 @@ if refresh_cache:
     else:
         run_pipeline(force_refresh_cache=True)
 
-st.caption("Ahrefs v3 baseline via /site-explorer/all-backlinks (history=all_time, aggregation=1_per_domain). New backlinks via /all-backlinks with where on first_seen_link and last_seen is null. Targets sanitized to avoid 'bad target' errors.")
+st.caption("Baseline via Ahrefs v3 /site-explorer/all-backlinks (history=all_time, aggregation=1_per_domain). New backlinks via the same endpoint with a first_seen window and last_seen is null. Targets sanitized; cache avoids persisting empty results.")
