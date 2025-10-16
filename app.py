@@ -1,12 +1,11 @@
 """
 Streamlit app: Airtable → Ahrefs (last N days backlinks) vs Gambling.com referring domains
 
-Secrets required (Streamlit → Settings → Secrets) or env vars:
-- AHREFS_API_TOKEN
-- AIRTABLE_API_KEY
-- AIRTABLE_BASE_ID, AIRTABLE_TABLE, AIRTABLE_VIEW (optional), AIRTABLE_DOMAIN_FIELD
-- BLOCKLIST_BASE_IDS (comma-separated), BLOCKLIST_TABLE_NAME (table ID or name), BLOCKLIST_VIEW_ID (optional), BLOCKLIST_DOMAIN_FIELD
-- GAMBLING_DOMAIN (default "gambling.com")
+- Baseline (Gambling.com): Ahrefs v3 /site-explorer/all-backlinks with history=all_time
+  and aggregation=1_per_domain (schema: root_name_source,url_from)
+- New backlinks: Ahrefs v3 /site-explorer/all-backlinks with 1_per_domain + where window
+  on first_seen_link and last_seen is null
+- Targets sanitized to avoid "bad target" errors
 """
 
 import os
@@ -23,7 +22,7 @@ import tldextract
 from urllib.parse import urlparse
 
 # ----------------------------
-# Small utils
+# Utilities
 # ----------------------------
 
 def extract_registrable_domain(url_or_host: str) -> str:
@@ -37,14 +36,11 @@ def extract_registrable_domain(url_or_host: str) -> str:
 def url_to_host(url: str) -> str:
     try:
         p = urlparse(url)
-        if p.netloc:
-            return p.netloc
-        return url
+        return p.netloc or url
     except Exception:
         return url
 
 def iso_window_last_n_days(days: int) -> tuple[str, str]:
-    # Inclusive UTC window; end is "now"
     end = datetime.now(timezone.utc).replace(microsecond=0)
     start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0)
     return (
@@ -53,31 +49,31 @@ def iso_window_last_n_days(days: int) -> tuple[str, str]:
     )
 
 def sanitize_target_for_ahrefs(val: str) -> Optional[str]:
-    """Return a clean host (no scheme, no path, no spaces) or None if invalid."""
+    """Return a clean host for Ahrefs (no scheme/path/spaces); None if invalid."""
     if not val:
         return None
     s = str(val).strip().lower()
-    # parse if full URL
     try:
         p = urlparse(s)
         if p.scheme or p.netloc:
             s = p.netloc
     except Exception:
         pass
-    # remove trailing/leading junk and collapse spaces
     s = " ".join(s.split()).strip(" /.")
     if not s or " " in s or "." not in s or len(s) > 255:
         return None
-    # idna-safe
     try:
         s = s.encode("idna").decode("ascii")
     except Exception:
         return None
-    # remove trailing dot or slash if any slipped in
     s = s.rstrip("./")
-    # keep subdomain if present but make sure registrable part exists
     reg = extract_registrable_domain(s)
     return s if reg else None
+
+def merge_unique(a, b):
+    s = set(a or [])
+    s.update(b or [])
+    return sorted(s)
 
 # ----------------------------
 # Airtable client
@@ -117,10 +113,10 @@ class AirtableClient:
             data = r.json()
             for rec in data.get("records", []):
                 fields = rec.get("fields", {})
-                raw_val = fields.get(domain_field)
-                if not raw_val:
+                raw = fields.get(domain_field)
+                if not raw:
                     continue
-                values = raw_val if isinstance(raw_val, list) else [raw_val]
+                values = raw if isinstance(raw, list) else [raw]
                 for v in values:
                     host = url_to_host(str(v))
                     reg = extract_registrable_domain(host)
@@ -129,6 +125,7 @@ class AirtableClient:
             offset = data.get("offset")
             if not offset or len(rows) >= max_records:
                 break
+
         return sorted(set(rows))
 
 # ----------------------------
@@ -137,8 +134,7 @@ class AirtableClient:
 
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
-    ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"   # new backlinks + fallback
-    ENDPOINT_REF_DOMAINS = "/site-explorer/refdomains"    # primary for ref domains
+    ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"
 
     def __init__(self, token: str):
         self.session = requests.Session()
@@ -173,42 +169,15 @@ class AhrefsClient:
                 break
         return out
 
-    def fetch_referring_domains(self, target_domain: str, mode: str = "domain") -> List[str]:
-        # Primary: /refdomains with select + history=all_time
-        try:
-            rows = self._paginate(self.ENDPOINT_REF_DOMAINS, {
-                "target": target_domain,
-                "mode": mode,
-                "limit": 1000,
-                "select": "refdomain",
-                "history": "all_time",
-            })
-            out = []
-            for r in rows:
-                host = (
-                    r.get("refdomain") or
-                    r.get("referring_domain") or
-                    r.get("domain") or
-                    r.get("host") or
-                    r.get("url_from")
-                )
-                if host:
-                    out.append(extract_registrable_domain(url_to_host(host)))
-            uniq = sorted({d for d in out if d})
-            if uniq:
-                return uniq
-        except requests.HTTPError:
-            pass  # fall back below
-
-        # Fallback: /all-backlinks aggregated to 1_per_domain (full-ish set)
+    # Baseline: all historical referring domains using all-backlinks (1_per_domain)
+    def fetch_referring_domains_alltime(self, target_domain: str, mode: str = "domain") -> List[str]:
         rows = self._paginate(self.ENDPOINT_BACKLINKS, {
             "target": target_domain,
             "mode": mode,
             "limit": 1000,
+            "history": "all_time",
             "aggregation": "1_per_domain",
             "select": "root_name_source,url_from",
-            "order_by": "url_rating_source:desc",
-            "history": "all_time",
         })
         out = []
         for r in rows:
@@ -217,8 +186,8 @@ class AhrefsClient:
                 out.append(extract_registrable_domain(url_to_host(host)))
         return sorted({d for d in out if d})
 
+    # Last N days (new backlinks), de-duped by domain, only currently live
     def fetch_new_backlinks_last_n_days(self, target_domain: str, days: int = 14, mode: str = "domain") -> List[Dict[str, Any]]:
-        # Match your working curl: use /all-backlinks with select + where window + last_seen is null + 1_per_domain
         start_iso, end_iso = iso_window_last_n_days(days)
         where_obj = {
             "and": [
@@ -229,9 +198,9 @@ class AhrefsClient:
         }
         params = {
             "target": target_domain,
-            "mode": mode,                      # "domain" or "subdomains"
+            "mode": mode,
             "limit": 1000,
-            "history": f"since:{start_iso[:10]}",  # narrows historical window server-side
+            "history": f"since:{start_iso[:10]}",
             "order_by": "traffic:desc,url_rating_source:desc",
             "aggregation": "1_per_domain",
             "protocol": "both",
@@ -248,7 +217,7 @@ class AhrefsClient:
         return out
 
 # ----------------------------
-# Local cache (SQLite) for ref domains
+# Local cache for ref domains
 # ----------------------------
 
 DB_PATH = "./backlink_cache.sqlite"
@@ -266,6 +235,9 @@ def ensure_db():
         conn.commit()
 
 def save_ref_domains_to_cache(target_domain: str, domains: List[str]):
+    # don't persist empty results
+    if not domains:
+        return
     ensure_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -286,6 +258,12 @@ def load_ref_domains_from_cache(target_domain: str) -> Optional[Tuple[datetime, 
             return None
         return datetime.fromisoformat(row[0]), json.loads(row[1])
 
+def clear_cache_row(target_domain: str):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM ref_domain_cache WHERE target_domain = ?", (target_domain,))
+        conn.commit()
+
 # ----------------------------
 # Streamlit UI
 # ----------------------------
@@ -305,6 +283,7 @@ BLOCKLIST_TABLE   = S.get("BLOCKLIST_TABLE_NAME", "tbliCOQZY9RICLsLP")
 BLOCKLIST_VIEW_ID = S.get("BLOCKLIST_VIEW_ID", "")
 BLOCKLIST_FIELD   = S.get("BLOCKLIST_DOMAIN_FIELD", "Domain")
 
+# Other
 DEFAULT_GAMBLING = S.get("GAMBLING_DOMAIN", "gambling.com")
 
 with st.sidebar:
@@ -317,6 +296,7 @@ with st.sidebar:
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache = st.button("Refresh Gambling.com cache")
+    clear_cache_btn = st.button("Clear Gambling.com cache")
 
 AHREFS_TOKEN   = os.getenv("AHREFS_API_TOKEN", S.get("AHREFS_API_TOKEN", ""))
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_KEY",   S.get("AIRTABLE_API_KEY",   ""))
@@ -325,6 +305,10 @@ if not AHREFS_TOKEN:
     st.info("Set AHREFS_API_TOKEN in Streamlit Secrets or environment.")
 if not AIRTABLE_TOKEN:
     st.info("Set AIRTABLE_API_KEY in Streamlit Secrets or environment.")
+
+if clear_cache_btn:
+    clear_cache_row(gambling_domain)
+    st.success("Cleared cache entry for Gambling.com. Click 'Refresh Gambling.com cache' to fetch again.")
 
 # ----------------------------
 # Pipeline
@@ -358,20 +342,32 @@ def run_pipeline(force_refresh_cache: bool = False):
             for err in load_errors:
                 st.write(f"- {err}")
 
-    # 3) Gambling.com ref domains (cache)
-    st.write("## 3) Gambling.com referring domains")
+    # 3) Gambling.com baseline (cache + fresh if needed)
+    st.write("## 3) Gambling.com referring domains (baseline)")
     ah = AhrefsClient(AHREFS_TOKEN)
     cache_hit = None if force_refresh_cache else load_ref_domains_from_cache(gambling_domain)
     if cache_hit:
         fetched_at, gdc_ref_domains = cache_hit
         st.write(f"Cache hit: **{len(gdc_ref_domains)}** domains (cached {fetched_at.isoformat()})")
     else:
-        with st.spinner("Fetching referring domains from Ahrefs v3…"):
-            # sanitize gambling.com target too
-            gdc_target = sanitize_target_for_ahrefs(gambling_domain) or "gambling.com"
-            gdc_ref_domains = ah.fetch_referring_domains(gdc_target)
-            save_ref_domains_to_cache(gambling_domain, gdc_ref_domains)
-        st.write(f"Fetched and cached **{len(gdc_ref_domains)}** referring domains for **{gambling_domain}**.")
+        with st.spinner("Fetching baseline ref domains from Ahrefs v3 (all_time, 1_per_domain)…"):
+            # try naked + www, then merge unique
+            t1 = sanitize_target_for_ahrefs(gambling_domain) or "gambling.com"
+            t2 = "www.gambling.com"
+            d1, d2 = [], []
+            try:
+                d1 = ah.fetch_referring_domains_alltime(t1)
+            except requests.HTTPError as e:
+                st.warning(f"Baseline fetch failed for {t1}: {e}")
+            try:
+                d2 = ah.fetch_referring_domains_alltime(t2)
+            except requests.HTTPError as e:
+                st.info(f"Baseline fetch also failed for {t2}: {e}")
+            gdc_ref_domains = merge_unique(d1, d2)
+            if gdc_ref_domains:
+                save_ref_domains_to_cache(gambling_domain, gdc_ref_domains)
+
+        st.write(f"Fetched {'**0**' if not gdc_ref_domains else f'**{len(gdc_ref_domains)}**'} referring domains for **{gambling_domain}**.")
     gdc_ref_set: Set[str] = set(gdc_ref_domains)
 
     # 4) New backlinks per competitor
@@ -410,12 +406,12 @@ def run_pipeline(force_refresh_cache: bool = False):
         time.sleep(0.15)
 
     if bad_targets:
-        st.warning(f"Skipped {bad_targets} invalid targets from Airtable (values with spaces, full URLs, or typos).")
+        st.warning(f"Skipped {bad_targets} invalid targets from Airtable (spaces, full URLs, typos).")
 
     # 5) Results
     st.write("## 5) Final results — exclusive domains")
     if not output_records:
-        st.success("No exclusive domains found after filtering Gambling.com and blocklists.")
+        st.success("No exclusive domains found after filtering Gambling.com baseline and blocklists.")
         return
     df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["competitor", "linking_domain"])
     st.dataframe(df, use_container_width=True)
@@ -434,4 +430,4 @@ if refresh_cache:
     else:
         run_pipeline(force_refresh_cache=True)
 
-st.caption("Ahrefs v3: /site-explorer/refdomains (history=all_time, select=refdomain) and /site-explorer/all-backlinks (select + where on first_seen_link; last_seen is null; 1_per_domain). Targets sanitized to avoid 'bad target' errors.")
+st.caption("Ahrefs v3 baseline via /site-explorer/all-backlinks (history=all_time, aggregation=1_per_domain). New backlinks via /all-backlinks with where on first_seen_link and last_seen is null. Targets sanitized to avoid 'bad target' errors.")
