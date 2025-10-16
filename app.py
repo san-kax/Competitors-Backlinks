@@ -1,4 +1,4 @@
-# v1.5.3 — Fixed API endpoint to match exact Ahrefs interface parameters
+# v1.5.4 — Fixed API response parsing to handle 'backlinks' array structure
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.3",
+        "User-Agent":"gdc-competitor-backlinks/1.5.4",
         "Connection":"keep-alive",
     })
     return sess
@@ -130,9 +130,16 @@ class AhrefsClient:
             q = params.copy()
             if cursor: q["cursor"] = cursor
             data = self._get(path, q)
-            items = data.get("data") or data.get("items") or {}
-            rows = items.get("rows", []) if isinstance(items, dict) else items
-            out.extend(rows)
+            
+            # FIXED: Check for backlinks array first (based on debug output)
+            if "backlinks" in data:
+                out.extend(data["backlinks"])
+            else:
+                # Fallback to original structure
+                items = data.get("data") or data.get("items") or {}
+                rows = items.get("rows", []) if isinstance(items, dict) else items
+                out.extend(rows)
+            
             cursor = data.get("next") or data.get("cursor")
             if not cursor: break
         return out
@@ -165,9 +172,11 @@ class AhrefsClient:
                 st.write("🔍 API Response Debug:")
                 st.json(result)
             
-            # Check different possible response structures
+            # FIXED: Check the correct response structure (backlinks array)
             rows_count = 0
-            if "data" in result and "rows" in result["data"]:
+            if "backlinks" in result:
+                rows_count = len(result["backlinks"])
+            elif "data" in result and "rows" in result["data"]:
                 rows_count = len(result["data"]["rows"])
             elif "items" in result:
                 rows_count = len(result["items"])
@@ -563,4 +572,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.3 - Fixed API endpoint to match exact Ahrefs interface parameters. Uses www.gambling.com format, aggregation=1_per_domain, and live links only filter. Added comprehensive debugging and response structure checking.") 
+st.caption("v1.5.4 - Fixed API response parsing to handle 'backlinks' array structure. Now correctly parses the actual Ahrefs API response format and should show the correct number of backlinks found.") 
