@@ -1,4 +1,4 @@
-# v1.5.1 — robust baseline variants for Ahrefs v3 (typo fix: history_all_time)
+# v1.5.2 — Fixed API endpoint to match working Ahrefs v3 call
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.1",
+        "User-Agent":"gdc-competitor-backlinks/1.5.2",
         "Connection":"keep-alive",
     })
     return sess
@@ -137,7 +137,27 @@ class AhrefsClient:
             if not cursor: break
         return out
 
-    # ---- Baseline: try multiple variants on /all-backlinks then /refdomains ----
+    def test_exact_api_call(self, target: str) -> Dict[str, Any]:
+        """Test the exact API call from the Ahrefs interface"""
+        params = {
+            "target": f"{target}/",
+            "mode": "subdomains",
+            "limit": 100,
+            "history": "all_time", 
+            "protocol": "both",
+            "aggregation": "1_per_domain",
+            "order_by": "traffic:desc,url_rating_source:desc",
+            "select": "url_from,link_group_count,title,languages,powered_by,link_type,redirect_code,first_seen_link,lost_reason,drop_reason,http_code,discovered_status,source_page_author,is_dofollow,is_nofollow,is_ugc,is_sponsored,is_content,domain_rating_source,traffic_domain,is_root_source,is_spam,root_name_source,traffic,positions,links_external,url_rating_source,last_visited,refdomains_source,linked_domains_source_page,snippet_left,anchor,snippet_right,url_to,js_crawl,http_crawl,redirect_kind,url_redirect,broken_redirect_source,broken_redirect_new_target,broken_redirect_reason,last_seen",
+            "where": json.dumps({"field": "last_seen", "is": "is_null"})
+        }
+        
+        try:
+            result = self._get(self.EP_BACKLINKS, params)
+            return {"success": True, "data": result, "rows_count": len(result.get("data", {}).get("rows", []))}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ---- Updated baseline with exact working API format ----
     def baseline_all_backlinks_variants(self, target: str, mode: str) -> Tuple[List[str], str]:
         """Return (domains, variant_note)."""
         def rows_to_domains(rows: List[Dict[str, Any]]) -> List[str]:
@@ -150,12 +170,36 @@ class AhrefsClient:
                     if reg: out.append(reg)
             return sorted(set(out))
 
-        # Build the 8 variants
+        # Try the exact working API call first
+        exact_params = {
+            "target": f"{target}/",  # Add trailing slash!
+            "mode": "subdomains",    # Use subdomains mode
+            "limit": 100,            # Match the working example
+            "history": "all_time",
+            "protocol": "both",
+            "aggregation": "1_per_domain",
+            "order_by": "traffic:desc,url_rating_source:desc",
+            "select": "url_from,link_group_count,title,languages,powered_by,link_type,redirect_code,first_seen_link,lost_reason,drop_reason,http_code,discovered_status,source_page_author,is_dofollow,is_nofollow,is_ugc,is_sponsored,is_content,domain_rating_source,traffic_domain,is_root_source,is_spam,root_name_source,traffic,positions,links_external,url_rating_source,last_visited,refdomains_source,linked_domains_source_page,snippet_left,anchor,snippet_right,url_to,js_crawl,http_crawl,redirect_kind,url_redirect,broken_redirect_source,broken_redirect_new_target,broken_redirect_reason,last_seen",
+            "where": json.dumps({"field": "last_seen", "is": "is_null"})
+        }
+        
+        try:
+            rows = self._paginate(self.EP_BACKLINKS, exact_params)
+            doms = rows_to_domains(rows)
+            if doms:
+                return doms, "/all-backlinks [exact working format]"
+        except requests.HTTPError as e:
+            st.warning(f"Exact API format failed: {str(e)[:100]}...")
+
+        # Fallback to original variants if exact format fails
         def variant_params(history_all_time: bool, aggregation: bool, with_select: bool):
             p = {
-                "target": target, "mode": mode, "limit": 1000,
+                "target": f"{target}/",  # Add trailing slash
+                "mode": "subdomains",    # Use subdomains mode
+                "limit": 1000,
                 "history": "all_time" if history_all_time else "since:2000-01-01",
                 "protocol": "both",
+                "order_by": "traffic:desc,url_rating_source:desc",
             }
             if aggregation: p["aggregation"] = "1_per_domain"
             if with_select: p["select"] = "url_from"
@@ -173,7 +217,7 @@ class AhrefsClient:
 
         last_err = None
         for hist, agg, sel in variants:
-            history_all_time = (hist == "all_time")  # ← fixed name
+            history_all_time = (hist == "all_time")
             params = variant_params(history_all_time=history_all_time, aggregation=agg, with_select=sel)
             note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'}]"
             try:
@@ -183,7 +227,6 @@ class AhrefsClient:
                     return doms, note
             except requests.HTTPError as e:
                 last_err = e
-                # continue trying other shapes; many plans reject select/columns
                 continue
         if last_err:
             return [], f"/all-backlinks failed ({str(last_err)[:90]}…)"
@@ -191,7 +234,11 @@ class AhrefsClient:
         return [], "/all-backlinks returned empty in all variants"
 
     def baseline_refdomains_relaxed(self, target: str, mode: str) -> Tuple[List[str], str]:
-        params = { "target": target, "mode": mode, "limit": 1000 }  # no order_by, no select
+        params = { 
+            "target": f"{target}/",  # Add trailing slash
+            "mode": "subdomains",    # Use subdomains mode
+            "limit": 1000 
+        }
         try:
             rows = self._paginate(self.EP_REFDOMAINS, params)
         except requests.HTTPError as e:
@@ -211,11 +258,14 @@ class AhrefsClient:
                             {"field":"first_seen_link","is":["lte",end_iso]},
                             {"field":"last_seen","is":"is_null"}]}
         rows = self._paginate(self.EP_BACKLINKS, {
-            "target": target, "mode": mode, "limit": 1000,
+            "target": f"{target}/",  # Add trailing slash
+            "mode": "subdomains",    # Use subdomains mode
+            "limit": 1000,
             "history": f"since:{start_iso[:10]}",
             "order_by": "traffic:desc,url_rating_source:desc",
-            "aggregation": "1_per_domain", "protocol":"both",
-            "select": "url_from,first_seen_link",  # minimal
+            "aggregation": "1_per_domain", 
+            "protocol":"both",
+            "select": "url_from,first_seen_link",
             "where": json.dumps(where_obj),
         })
         out=[]
@@ -289,6 +339,7 @@ with st.sidebar:
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache_btn = st.button("Refresh Gambling.com cache")
     clear_cache_btn = st.button("Clear Gambling.com cache")
+    test_api_btn = st.button("Test Ahrefs API", type="secondary")
 
 AHREFS_TOKEN   = os.getenv("AHREFS_API_TOKEN", S.get("AHREFS_API_TOKEN", ""))
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_KEY",   S.get("AIRTABLE_API_KEY",   ""))
@@ -301,8 +352,30 @@ if not AIRTABLE_TOKEN: st.info("Set AIRTABLE_API_KEY in Secrets or env.")
 
 shared_session = make_session()
 
+# ---------------- API Test ----------------
+if test_api_btn:
+    if not AHREFS_TOKEN:
+        st.error("AHREFS_API_TOKEN is required for testing")
+    else:
+        st.write("## Testing Ahrefs API...")
+        ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
+        
+        # Test with gambling.com
+        test_result = ah.test_exact_api_call(gambling_domain)
+        if test_result["success"]:
+            st.success(f"✅ API test successful! Found {test_result['rows_count']} backlinks for {gambling_domain}")
+            if show_debug:
+                st.json(test_result["data"])
+        else:
+            st.error(f"❌ API test failed: {test_result['error']}")
+
 # ---------------- pipeline ----------------
 def run_pipeline(force_refresh_cache: bool = False):
+    st.write("🚀 Starting pipeline...")
+    st.write(f"AHREFS_TOKEN present: {bool(AHREFS_TOKEN)}")
+    st.write(f"AIRTABLE_TOKEN present: {bool(AIRTABLE_TOKEN)}")
+    st.write(f"Configuration: base_id={airtable_base_id}, table={airtable_table}")
+    
     # 1) Competitors
     st.write("## 1) Fetch competitors from primary Airtable…")
     at = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
@@ -330,7 +403,7 @@ def run_pipeline(force_refresh_cache: bool = False):
         with st.expander("Blocklist load warnings"):
             for err in load_errors: st.write(f"- {err}")
 
-    # 3) Gambling.com baseline (cache → 8 variants of all-backlinks → refdomains)
+    # 3) Gambling.com baseline (cache → exact API format → 8 variants of all-backlinks → refdomains)
     st.write("## 3) Gambling.com referring domains (baseline)")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
@@ -433,10 +506,16 @@ if run_btn:
     if not (airtable_base_id and airtable_table and AHREFS_TOKEN and AIRTABLE_TOKEN):
         st.error("Please set AIRTABLE_* and AHREFS_API_TOKEN in Secrets or environment.")
     else:
+        st.write("🔍 Debug: Button clicked, checking configuration...")
+        st.write(f"AHREFS_TOKEN: {'✅ Set' if AHREFS_TOKEN else '❌ Missing'}")
+        st.write(f"AIRTABLE_TOKEN: {'✅ Set' if AIRTABLE_TOKEN else '❌ Missing'}")
+        st.write(f"Base ID: {airtable_base_id}")
+        st.write(f"Table: {airtable_table}")
+        st.write("✅ All configuration looks good, starting pipeline...")
         run_pipeline(force_refresh_cache=False)
 
 if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("Baseline tries 8 variants of /all-backlinks (varying history, aggregation, and select) and, if still empty, falls back to /refdomains without order_by/select. New backlinks via /all-backlinks with minimal select. Pooled HTTP + threading for speed.")
+st.caption("v1.5.2 - Fixed API endpoint to match working Ahrefs v3 call. Uses exact format from Ahrefs interface: trailing slash, subdomains mode, comprehensive select parameter, and proper order_by. Added API test button for debugging.") 
