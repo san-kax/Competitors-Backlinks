@@ -1,14 +1,6 @@
-"""
-Streamlit: Airtable → Ahrefs (last N days backlinks) vs Gambling.com referring domains
+# (same header docstring omitted for brevity — this is version 1.4)
 
-Fast (pooled HTTP + threading). Robust baseline:
-- /all-backlinks (history=all_time, 1_per_domain) with select fallback
-- if empty or 400 "select: column … not found" → /refdomains with select fallback
-"""
-
-import os
-import json
-import sqlite3
+import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +15,6 @@ import tldextract
 from urllib.parse import urlparse
 
 # ---------- utils ----------
-
 def extract_registrable_domain(url_or_host: str) -> str:
     if not url_or_host:
         return ""
@@ -82,13 +73,16 @@ def make_session() -> requests.Session:
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=["GET"], raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=60, pool_maxsize=60)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=80, pool_maxsize=80)
     sess.mount("https://", adapter); sess.mount("http://", adapter)
-    sess.headers.update({"Accept-Encoding":"gzip, deflate","User-Agent":"gdc-competitor-backlinks/1.3","Connection":"keep-alive"})
+    sess.headers.update({
+        "Accept-Encoding":"gzip, deflate",
+        "User-Agent":"gdc-competitor-backlinks/1.4",
+        "Connection":"keep-alive",
+    })
     return sess
 
 # ---------- Airtable ----------
-
 class AirtableClient:
     def __init__(self, api_key: str, base_id: str, session: Optional[requests.Session] = None):
         self.base_url = f"https://api.airtable.com/v0/{base_id}"
@@ -115,7 +109,6 @@ class AirtableClient:
         return sorted(set(rows))
 
 # ---------- Ahrefs v3 ----------
-
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"
@@ -144,71 +137,59 @@ class AhrefsClient:
             if not cursor: break
         return out
 
-    def _paginate_with_select_fallback(self, path: str, base_params: Dict[str, Any], selects: List[str]) -> List[Dict[str, Any]]:
-        """Try a list of select strings until one works on this account/schema."""
+    def _paginate_with_select_fallback(self, path: str, base_params: Dict[str, Any], selects: List[Optional[str]]) -> List[Dict[str, Any]]:
         last_err = None
         for sel in selects:
             params = base_params.copy()
-            params["select"] = sel
+            if sel: params["select"] = sel
+            else: params.pop("select", None)  # omit select entirely
             try:
                 return self._paginate(path, params)
             except requests.HTTPError as e:
                 msg = str(e)
-                if "select: column" in msg:
-                    last_err = e
-                    continue
+                # Keep trying if it's a select-related error; otherwise bubble up
+                if "select:" in msg or "column" in msg:
+                    last_err = e; continue
                 else:
                     raise
-        if last_err:
-            raise last_err
+        if last_err: raise last_err
         return []
 
-    # Baseline Plan A: all-backlinks (all_time, 1_per_domain) with select fallback
+    # Baseline Plan A: all-backlinks (all_time, 1_per_domain) — URL parsing only
     def baseline_all_backlinks(self, target: str, mode: str) -> List[str]:
         base_params = {
             "target": target, "mode": mode, "limit": 1000,
             "history": "all_time", "aggregation": "1_per_domain",
         }
-        # Try stricter first, then minimal universal columns
         rows = self._paginate_with_select_fallback(
             self.ENDPOINT_BACKLINKS, base_params,
-            selects=[
-                "root_name_source,url_from,host",
-                "url_from,host",
-            ],
+            selects=[ "url_from", None ],  # try url_from only, then no select
         )
         out=[]
         for r in rows:
-            cand = r.get("root_name_source") or r.get("host")
-            if not cand:
-                uf = r.get("url_from"); cand = url_to_host(uf) if uf else None
-            if cand:
-                reg = extract_registrable_domain(cand)
+            uf = r.get("url_from")
+            if uf:
+                host = url_to_host(uf)
+                reg = extract_registrable_domain(host)
                 if reg: out.append(reg)
         return sorted(set(out))
 
-    # Baseline Plan B: /refdomains with select fallback
+    # Baseline Plan B: /refdomains — no order_by, no select assumptions
     def baseline_refdomains(self, target: str, mode: str) -> List[str]:
-        base_params = {
-            "target": target, "mode": mode, "limit": 1000,
-            "history": "all_time", "order_by": "dr:desc",
-        }
+        base_params = { "target": target, "mode": mode, "limit": 1000 }
         rows = self._paginate_with_select_fallback(
             self.ENDPOINT_REFDOMAINS, base_params,
-            selects=[
-                "domain",
-                "host",
-            ],
+            selects=[ "domain", None ],  # try 'domain', then omit select
         )
         out=[]
         for r in rows:
-            cand = r.get("domain") or r.get("host")
+            cand = r.get("domain") or r.get("referring_domain") or r.get("host")
             if cand:
                 reg = extract_registrable_domain(cand)
                 if reg: out.append(reg)
         return sorted(set(out))
 
-    # New backlinks (last N days) — /all-backlinks
+    # New backlinks (last N days) — keep minimal select
     def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
         start_iso, end_iso = iso_window_last_n_days(days)
         where_obj = {"and":[{"field":"first_seen_link","is":["gte",start_iso]},
@@ -219,7 +200,7 @@ class AhrefsClient:
             "history": f"since:{start_iso[:10]}",
             "order_by": "traffic:desc,url_rating_source:desc",
             "aggregation": "1_per_domain", "protocol":"both",
-            "select": "url_from,anchor,first_seen_link,traffic,url_rating_source",
+            "select": "url_from,first_seen_link",  # minimal, universally safe
             "where": json.dumps(where_obj),
         })
         out=[]
@@ -229,7 +210,6 @@ class AhrefsClient:
         return out
 
 # ---------- cache ----------
-
 DB_PATH = "./backlink_cache.sqlite"
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ref_domain_cache (
@@ -238,7 +218,6 @@ CREATE TABLE IF NOT EXISTS ref_domain_cache (
   domains_json TEXT NOT NULL
 );
 """
-
 def ensure_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(CREATE_TABLE_SQL); conn.commit()
@@ -266,7 +245,6 @@ def clear_cache_row(target_domain: str):
         conn.commit()
 
 # ---------- UI ----------
-
 st.set_page_config(page_title="Competitor New Backlinks vs Gambling.com", layout="wide")
 S = st.secrets if hasattr(st, "secrets") else {}
 
@@ -309,7 +287,6 @@ if not AIRTABLE_TOKEN: st.info("Set AIRTABLE_API_KEY in Secrets or env.")
 shared_session = make_session()
 
 # ---------- pipeline ----------
-
 def run_pipeline(force_refresh_cache: bool = False):
     # 1) Competitors
     st.write("## 1) Fetch competitors from primary Airtable…")
@@ -357,7 +334,7 @@ def run_pipeline(force_refresh_cache: bool = False):
         t_www   = "www.gambling.com" if "www." not in t_naked else t_naked
         combos = [(t_naked,"domain"), (t_naked,"subdomains"), (t_www,"domain"), (t_www,"subdomains")]
 
-        # Plan A: all-backlinks
+        # Plan A: all-backlinks (url_from only)
         parts_A, errs_A = [], []
         with st.spinner("Fetching baseline (all-backlinks)…"):
             with ThreadPoolExecutor(max_workers=4) as pool:
@@ -370,7 +347,7 @@ def run_pipeline(force_refresh_cache: bool = False):
             gdc_ref_domains = merged_A
             baseline_notes.append(f"Baseline via /all-backlinks ({len(merged_A)} domains).")
         else:
-            # Plan B: refdomains fallback
+            # Plan B: refdomains (no order_by, no select)
             parts_B, errs_B = [], []
             with st.spinner("Fallback to /refdomains…"):
                 with ThreadPoolExecutor(max_workers=4) as pool:
@@ -435,7 +412,6 @@ def run_pipeline(force_refresh_cache: bool = False):
     st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "exclusive_domains.csv")
 
 # ---------- actions ----------
-
 if run_btn:
     if not (airtable_base_id and airtable_table and AHREFS_TOKEN and AIRTABLE_TOKEN):
         st.error("Please set AIRTABLE_* and AHREFS_API_TOKEN in Secrets or environment.")
@@ -446,4 +422,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("Baseline tries /all-backlinks (history=all_time, aggregation=1_per_domain) then falls back to /refdomains if empty. Both use select-fallbacks to avoid plan/schema issues. New backlinks via /all-backlinks with a first_seen window + last_seen is null. Threaded & pooled HTTP; empty baselines are never cached.")
+st.caption("Baseline via /all-backlinks (history=all_time, aggregation=1_per_domain) using url_from only; fallback to /refdomains without order_by or select when needed. New backlinks via /all-backlinks with minimal select. Threaded + pooled HTTP for speed.")
