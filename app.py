@@ -15,8 +15,12 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import pandas as pd
 import streamlit as st
 import tldextract
@@ -79,16 +83,39 @@ def merge_unique(*lists: List[str]) -> List[str]:
     return sorted(s)
 
 # ----------------------------
+# HTTP session factory (faster & robust)
+# ----------------------------
+
+def make_session() -> requests.Session:
+    sess = requests.Session()
+    # retries & backoff for transient errors/rate limits
+    retries = Retry(
+        total=5,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    sess.headers.update({
+        "Accept-Encoding": "gzip, deflate",
+        "User-Agent": "gdc-competitor-backlinks/1.0",
+        "Connection": "keep-alive",
+    })
+    return sess
+
+# ----------------------------
 # Airtable client
 # ----------------------------
 
 class AirtableClient:
-    def __init__(self, api_key: str, base_id: str):
+    def __init__(self, api_key: str, base_id: str, session: Optional[requests.Session] = None):
         self.base_url = f"https://api.airtable.com/v0/{base_id}"
-        self.session = requests.Session()
+        self.session = session or make_session()
         self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
         })
 
     def fetch_domains(
@@ -96,10 +123,15 @@ class AirtableClient:
         table_or_id: str,
         domain_field: str,
         view_or_id: Optional[str] = None,
-        max_records: int = 10000,
+        max_records: int = 20000,
     ) -> List[str]:
         url = f"{self.base_url}/{requests.utils.quote(table_or_id)}"
-        params = {"pageSize": 100}
+        params = {
+            "pageSize": 100,
+            "maxRecords": max_records,
+        }
+        # request only the domain field to reduce payload
+        params["fields[]"] = domain_field
         if view_or_id:
             params["view"] = view_or_id
 
@@ -108,7 +140,7 @@ class AirtableClient:
         while True:
             if offset:
                 params["offset"] = offset
-            r = self.session.get(url, params=params, timeout=60)
+            r = self.session.get(url, params=params, timeout=40)
             if not r.ok:
                 raise requests.HTTPError(
                     f"Airtable error {r.status_code} for table '{table_or_id}': {r.text[:300]}"
@@ -138,8 +170,8 @@ class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"
 
-    def __init__(self, token: str):
-        self.session = requests.Session()
+    def __init__(self, token: str, session: Optional[requests.Session] = None):
+        self.session = session or make_session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -147,10 +179,7 @@ class AhrefsClient:
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.BASE}{path}"
-        r = self.session.get(url, params=params, timeout=120)
-        if r.status_code == 429:
-            time.sleep(2)
-            r = self.session.get(url, params=params, timeout=120)
+        r = self.session.get(url, params=params, timeout=60)
         if not r.ok:
             raise requests.HTTPError(f"Ahrefs v3 {path} failed: HTTP {r.status_code} :: {r.text[:300]}")
         return r.json()
@@ -171,15 +200,15 @@ class AhrefsClient:
                 break
         return out
 
-    # Baseline: all-time referring domains via /all-backlinks (1_per_domain), robust parsing
+    # Baseline: all-time referring domains via /all-backlinks (1_per_domain), with required select
     def fetch_referring_domains_alltime(self, target_domain: str, mode: str = "domain") -> List[str]:
         rows = self._paginate(self.ENDPOINT_BACKLINKS, {
             "target": target_domain,
-            "mode": mode,                # we'll call both domain & subdomains outside
+            "mode": mode,                # we'll call both domain & subdomains in pipeline
             "limit": 1000,
             "history": "all_time",
             "aggregation": "1_per_domain",
-            # deliberately NO 'select' so we don't miss fields on some plans
+            "select": "root_name_source,url_from,root_domain,referring_domain,host",
         })
         out = []
         for r in rows:
@@ -295,7 +324,7 @@ BLOCKLIST_TABLE   = S.get("BLOCKLIST_TABLE_NAME", "tbliCOQZY9RICLsLP")
 BLOCKLIST_VIEW_ID = S.get("BLOCKLIST_VIEW_ID", "")
 BLOCKLIST_FIELD   = S.get("BLOCKLIST_DOMAIN_FIELD", "Domain")
 
-# Other
+# Other defaults
 DEFAULT_GAMBLING = S.get("GAMBLING_DOMAIN", "gambling.com")
 
 with st.sidebar:
@@ -306,6 +335,7 @@ with st.sidebar:
     airtable_domain_field = st.text_input("Airtable Domain Field", value=DEFAULT_DOMAIN_FIELD)
     days = st.number_input("Window (days)", min_value=1, max_value=60, value=14)
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
+    max_concurrency = st.slider("Ahrefs concurrency", 2, 20, 8, help="Parallel competitor calls")
     show_debug = st.checkbox("Show debug counts", value=False)
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache = st.button("Refresh Gambling.com cache")
@@ -323,6 +353,9 @@ if clear_cache_btn:
     clear_cache_row(gambling_domain)
     st.success("Cleared cache entry for Gambling.com. Click 'Refresh Gambling.com cache' to fetch again.")
 
+# Shared HTTP session for speed
+shared_session = make_session()
+
 # ----------------------------
 # Pipeline
 # ----------------------------
@@ -330,26 +363,40 @@ if clear_cache_btn:
 def run_pipeline(force_refresh_cache: bool = False):
     # 1) Competitors
     st.write("## 1) Fetch competitors from primary Airtable…")
-    at = AirtableClient(AIRTABLE_TOKEN, airtable_base_id)
-    competitors = at.fetch_domains(airtable_table, airtable_domain_field, view_or_id=(airtable_view or None))
+    at = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
+    competitors_raw = at.fetch_domains(airtable_table, airtable_domain_field, view_or_id=(airtable_view or None))
+    # sanitize and de-dupe
+    competitors = []
+    for d in competitors_raw:
+        t = sanitize_target_for_ahrefs(d)
+        if t:
+            competitors.append(t)
+    competitors = sorted(set(competitors))
     st.write(f"Found **{len(competitors)}** competitor domains.")
 
-    # 2) Blocklists
+    # 2) Blocklists (threaded)
     st.write("## 2) Loading blocklist Airtable bases…")
     blocklist_domains: Set[str] = set()
     load_errors = []
-    for base in BLOCKLIST_IDS:
-        base = base.strip()
-        if not base:
-            continue
-        atb = AirtableClient(AIRTABLE_TOKEN, base)
+
+    def load_blocklist(base_id: str) -> Set[str]:
+        if not base_id.strip():
+            return set()
+        cli = AirtableClient(AIRTABLE_TOKEN, base_id.strip(), session=shared_session)
         try:
-            blocklist_domains.update(
-                atb.fetch_domains(BLOCKLIST_TABLE, BLOCKLIST_FIELD, view_or_id=(BLOCKLIST_VIEW_ID or None))
-            )
+            lst = cli.fetch_domains(BLOCKLIST_TABLE, BLOCKLIST_FIELD, view_or_id=(BLOCKLIST_VIEW_ID or None))
+            return set(lst)
         except requests.HTTPError as e:
             load_errors.append(str(e))
-    st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len(BLOCKLIST_IDS)}** base(s).")
+            return set()
+
+    if BLOCKLIST_IDS:
+        with ThreadPoolExecutor(max_workers=min(8, len(BLOCKLIST_IDS))) as pool:
+            futures = [pool.submit(load_blocklist, b) for b in BLOCKLIST_IDS]
+            for fut in as_completed(futures):
+                blocklist_domains.update(fut.result() or set())
+
+    st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len([b for b in BLOCKLIST_IDS if b.strip()])}** base(s).")
     if load_errors:
         with st.expander("Blocklist load warnings"):
             for err in load_errors:
@@ -357,7 +404,7 @@ def run_pipeline(force_refresh_cache: bool = False):
 
     # 3) Gambling.com baseline (cache + fresh if needed)
     st.write("## 3) Gambling.com referring domains (baseline)")
-    ah = AhrefsClient(AHREFS_TOKEN)
+    ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
     cache_hit = None if force_refresh_cache else load_ref_domains_from_cache(gambling_domain)
     if cache_hit:
@@ -369,15 +416,23 @@ def run_pipeline(force_refresh_cache: bool = False):
             t_www   = "www.gambling.com" if "www." not in t_naked else t_naked
 
             parts, errors = [], []
-            for tgt in {t_naked, t_www}:
-                for md in ("domain", "subdomains"):
-                    try:
-                        part = ah.fetch_referring_domains_alltime(tgt, mode=md)
-                        if show_debug:
-                            st.write(f"• {tgt} [{md}] → {len(part)} domains")
-                        parts.append(part)
-                    except requests.HTTPError as e:
-                        errors.append(f"{tgt} [{md}]: {e}")
+
+            def fetch_one(tgt: str, md: str) -> List[str]:
+                try:
+                    r = ah.fetch_referring_domains_alltime(tgt, mode=md)
+                    if show_debug:
+                        st.write(f"• {tgt} [{md}] → {len(r)} domains")
+                    return r
+                except requests.HTTPError as e:
+                    errors.append(f"{tgt} [{md}]: {e}")
+                    return []
+
+            # Try all four in parallel for speed
+            combos = [(t_naked, "domain"), (t_naked, "subdomains"), (t_www, "domain"), (t_www, "subdomains")]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(fetch_one, t, m) for (t, m) in combos]
+                for fut in as_completed(futures):
+                    parts.append(fut.result())
 
             gdc_ref_domains = merge_unique(*parts)
             if errors:
@@ -391,53 +446,57 @@ def run_pipeline(force_refresh_cache: bool = False):
         st.write(f"Fetched {'**0**' if not gdc_ref_domains else f'**{len(gdc_ref_domains)}**'} referring domains for **{gambling_domain}**.")
     gdc_ref_set: Set[str] = set(gdc_ref_domains)
 
-    # 4) New backlinks per competitor
+    # 4) New backlinks per competitor (threaded)
     st.write("## 4) Fetching new backlinks from Ahrefs (last N days)…")
     output_records: List[Dict[str, Any]] = []
-    total = len(competitors)
-    progress = st.progress(0.0)
     bad_targets = 0
 
-    for i, comp in enumerate(competitors, 1):
-        target = sanitize_target_for_ahrefs(comp)
-        if not target:
-            bad_targets += 1
-            progress.progress(i / total if total else 1.0)
-            continue
-
+    def fetch_comp(comp: str) -> List[Dict[str, Any]]:
         try:
-            rows = ah.fetch_new_backlinks_last_n_days(target, days=days, mode="domain")
+            rows = ah.fetch_new_backlinks_last_n_days(comp, days=days, mode="domain")
+            if show_debug:
+                return [{"_debug": f"{comp}: {len(rows)} new"}, *rows]
+            return rows
         except requests.HTTPError as e:
-            st.error(f"Ahrefs v3 error for {target}: {e}")
-            rows = []
+            return [{"_error": f"{comp}: {e}"}]
 
-        if show_debug:
-            st.write(f"{target}: {len(rows)} new backlinks (last {days}d)")
-
-        for r in rows:
-            src = r.get("source_url")
-            reg = extract_registrable_domain(url_to_host(src))
-            if not reg:
-                continue
-            if reg not in gdc_ref_set and reg not in blocklist_domains:
-                output_records.append({
-                    "competitor": target,
-                    "linking_domain": reg,
-                    "source_url": src,
-                    "first_seen": r.get("first_seen"),
-                })
-        progress.progress(i / total if total else 1.0)
-        time.sleep(0.15)
-
-    if bad_targets:
-        st.warning(f"Skipped {bad_targets} invalid targets from Airtable (spaces, full URLs, typos).")
+    if competitors:
+        prog = st.progress(0.0)
+        done = 0
+        with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+            futures = [pool.submit(fetch_comp, comp) for comp in competitors]
+            for fut in as_completed(futures):
+                res = fut.result() or []
+                # handle debug/error records
+                keep = []
+                for r in res:
+                    if "_debug" in r:
+                        if show_debug:
+                            st.write(r["_debug"])
+                    elif "_error" in r:
+                        st.error(r["_error"])
+                    else:
+                        keep.append(r)
+                for r in keep:
+                    src = r.get("source_url")
+                    reg = extract_registrable_domain(url_to_host(src))
+                    if not reg:
+                        continue
+                    if reg not in gdc_ref_set and reg not in blocklist_domains:
+                        output_records.append({
+                            "linking_domain": reg,
+                            "source_url": src,
+                            "first_seen": r.get("first_seen"),
+                        })
+                done += 1
+                prog.progress(done / len(competitors))
 
     # 5) Results
     st.write("## 5) Final results — exclusive domains")
     if not output_records:
         st.success("No exclusive domains found after filtering Gambling.com baseline and blocklists.")
         return
-    df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["competitor", "linking_domain"])
+    df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["linking_domain"])
     st.dataframe(df, use_container_width=True)
     st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "exclusive_domains.csv")
 
@@ -454,4 +513,4 @@ if refresh_cache:
     else:
         run_pipeline(force_refresh_cache=True)
 
-st.caption("Baseline via Ahrefs v3 /site-explorer/all-backlinks (history=all_time, aggregation=1_per_domain). New backlinks via the same endpoint with a first_seen window and last_seen is null. Targets sanitized; cache avoids persisting empty results.")
+st.caption("Baseline via Ahrefs v3 /site-explorer/all-backlinks (history=all_time, aggregation=1_per_domain, select=root_name_source,url_from,...). New backlinks via same endpoint with first_seen window + last_seen is null. Threaded fetch & pooled HTTP for speed. Targets sanitized; empty results are not cached.")
