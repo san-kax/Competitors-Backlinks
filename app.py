@@ -1,4 +1,4 @@
-# (same header docstring omitted for brevity — this is version 1.4)
+# v1.5 — robust baseline variants for Ahrefs v3
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -14,7 +14,7 @@ import streamlit as st
 import tldextract
 from urllib.parse import urlparse
 
-# ---------- utils ----------
+# ---------------- utils ----------------
 def extract_registrable_domain(url_or_host: str) -> str:
     if not url_or_host:
         return ""
@@ -77,12 +77,12 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.4",
+        "User-Agent":"gdc-competitor-backlinks/1.5",
         "Connection":"keep-alive",
     })
     return sess
 
-# ---------- Airtable ----------
+# ---------------- Airtable ----------------
 class AirtableClient:
     def __init__(self, api_key: str, base_id: str, session: Optional[requests.Session] = None):
         self.base_url = f"https://api.airtable.com/v0/{base_id}"
@@ -108,11 +108,11 @@ class AirtableClient:
             if not offset or len(rows) >= max_records: break
         return sorted(set(rows))
 
-# ---------- Ahrefs v3 ----------
+# ---------------- Ahrefs v3 ----------------
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
-    ENDPOINT_BACKLINKS = "/site-explorer/all-backlinks"
-    ENDPOINT_REFDOMAINS = "/site-explorer/refdomains"
+    EP_BACKLINKS = "/site-explorer/all-backlinks"
+    EP_REFDOMAINS = "/site-explorer/refdomains"
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
         self.session = session or make_session()
@@ -137,57 +137,77 @@ class AhrefsClient:
             if not cursor: break
         return out
 
-    def _paginate_with_select_fallback(self, path: str, base_params: Dict[str, Any], selects: List[Optional[str]]) -> List[Dict[str, Any]]:
+    # ---- Baseline: try multiple variants on /all-backlinks then /refdomains ----
+    def baseline_all_backlinks_variants(self, target: str, mode: str) -> Tuple[List[str], str]:
+        """Return (domains, variant_note)."""
+        def rows_to_domains(rows: List[Dict[str, Any]]) -> List[str]:
+            out=[]
+            for r in rows:
+                uf = r.get("url_from") or r.get("source_url") or r.get("page")
+                if uf:
+                    host = url_to_host(uf)
+                    reg = extract_registrable_domain(host)
+                    if reg: out.append(reg)
+            return sorted(set(out))
+
+        # Build the 8 variants
+        def variant_params(history_all_time: bool, aggregation: bool, with_select: bool):
+            p = {
+                "target": target, "mode": mode, "limit": 1000,
+                "history": "all_time" if history_all_time else "since:2000-01-01",
+                "protocol": "both",
+            }
+            if aggregation: p["aggregation"] = "1_per_domain"
+            if with_select: p["select"] = "url_from"
+            return p
+
+        variants = []
+        # all_time first
+        for with_select in (True, False):
+            for aggregation in (True, False):
+                variants.append(("all_time", aggregation, with_select))
+        # then since:2000-01-01
+        for with_select in (True, False):
+            for aggregation in (True, False):
+                variants.append(("since", aggregation, with_select))
+
         last_err = None
-        for sel in selects:
-            params = base_params.copy()
-            if sel: params["select"] = sel
-            else: params.pop("select", None)  # omit select entirely
+        for hist, agg, sel in variants:
+            hist_all = (hist == "all_time")
+            params = variant_params(hist_all_time=hist_all, aggregation=agg, with_select=sel)
+            note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'}]"
             try:
-                return self._paginate(path, params)
+                rows = self._paginate(self.EP_BACKLINKS, params)
+                doms = rows_to_domains(rows)
+                if doms:
+                    return doms, note
             except requests.HTTPError as e:
-                msg = str(e)
-                # Keep trying if it's a select-related error; otherwise bubble up
-                if "select:" in msg or "column" in msg:
-                    last_err = e; continue
+                last_err = e
+                # if it's a select/column complaint, continue; else propagate
+                if "select:" in str(e) or "column" in str(e):
+                    continue
                 else:
-                    raise
-        if last_err: raise last_err
-        return []
+                    # keep trying the other variants anyway
+                    continue
+        if last_err:
+            # continue to refdomains fallback, but include last error in note
+            return [], f"/all-backlinks failed ({str(last_err)[:90]}…)"
 
-    # Baseline Plan A: all-backlinks (all_time, 1_per_domain) — URL parsing only
-    def baseline_all_backlinks(self, target: str, mode: str) -> List[str]:
-        base_params = {
-            "target": target, "mode": mode, "limit": 1000,
-            "history": "all_time", "aggregation": "1_per_domain",
-        }
-        rows = self._paginate_with_select_fallback(
-            self.ENDPOINT_BACKLINKS, base_params,
-            selects=[ "url_from", None ],  # try url_from only, then no select
-        )
-        out=[]
-        for r in rows:
-            uf = r.get("url_from")
-            if uf:
-                host = url_to_host(uf)
-                reg = extract_registrable_domain(host)
-                if reg: out.append(reg)
-        return sorted(set(out))
+        return [], "/all-backlinks returned empty in all variants"
 
-    # Baseline Plan B: /refdomains — no order_by, no select assumptions
-    def baseline_refdomains(self, target: str, mode: str) -> List[str]:
-        base_params = { "target": target, "mode": mode, "limit": 1000 }
-        rows = self._paginate_with_select_fallback(
-            self.ENDPOINT_REFDOMAINS, base_params,
-            selects=[ "domain", None ],  # try 'domain', then omit select
-        )
+    def baseline_refdomains_relaxed(self, target: str, mode: str) -> Tuple[List[str], str]:
+        params = { "target": target, "mode": mode, "limit": 1000 }  # no order_by, no select
+        try:
+            rows = self._paginate(self.EP_REFDOMAINS, params)
+        except requests.HTTPError as e:
+            return [], f"/refdomains failed ({str(e)[:90]}…)"
         out=[]
         for r in rows:
             cand = r.get("domain") or r.get("referring_domain") or r.get("host")
             if cand:
                 reg = extract_registrable_domain(cand)
                 if reg: out.append(reg)
-        return sorted(set(out))
+        return sorted(set(out)), "/refdomains (no order_by/select)"
 
     # New backlinks (last N days) — keep minimal select
     def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
@@ -195,12 +215,12 @@ class AhrefsClient:
         where_obj = {"and":[{"field":"first_seen_link","is":["gte",start_iso]},
                             {"field":"first_seen_link","is":["lte",end_iso]},
                             {"field":"last_seen","is":"is_null"}]}
-        rows = self._paginate(self.ENDPOINT_BACKLINKS, {
+        rows = self._paginate(self.EP_BACKLINKS, {
             "target": target, "mode": mode, "limit": 1000,
             "history": f"since:{start_iso[:10]}",
             "order_by": "traffic:desc,url_rating_source:desc",
             "aggregation": "1_per_domain", "protocol":"both",
-            "select": "url_from,first_seen_link",  # minimal, universally safe
+            "select": "url_from,first_seen_link",  # minimal
             "where": json.dumps(where_obj),
         })
         out=[]
@@ -209,7 +229,7 @@ class AhrefsClient:
             if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
         return out
 
-# ---------- cache ----------
+# ---------------- cache ----------------
 DB_PATH = "./backlink_cache.sqlite"
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ref_domain_cache (
@@ -244,7 +264,7 @@ def clear_cache_row(target_domain: str):
         conn.execute("DELETE FROM ref_domain_cache WHERE target_domain = ?", (target_domain,))
         conn.commit()
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 st.set_page_config(page_title="Competitor New Backlinks vs Gambling.com", layout="wide")
 S = st.secrets if hasattr(st, "secrets") else {}
 
@@ -286,7 +306,7 @@ if not AIRTABLE_TOKEN: st.info("Set AIRTABLE_API_KEY in Secrets or env.")
 
 shared_session = make_session()
 
-# ---------- pipeline ----------
+# ---------------- pipeline ----------------
 def run_pipeline(force_refresh_cache: bool = False):
     # 1) Competitors
     st.write("## 1) Fetch competitors from primary Airtable…")
@@ -295,11 +315,10 @@ def run_pipeline(force_refresh_cache: bool = False):
     competitors = sorted({sanitize_target_for_ahrefs(x) for x in competitors_raw if sanitize_target_for_ahrefs(x)})
     st.write(f"Found **{len(competitors)}** competitor domains.")
 
-    # 2) Blocklists (threaded)
+    # 2) Blocklists
     st.write("## 2) Loading blocklist Airtable bases…")
     blocklist_domains: Set[str] = set()
     load_errors = []
-
     def load_blocklist(base_id: str) -> Set[str]:
         if not base_id.strip(): return set()
         cli = AirtableClient(AIRTABLE_TOKEN, base_id.strip(), session=shared_session)
@@ -307,18 +326,16 @@ def run_pipeline(force_refresh_cache: bool = False):
             return set(cli.fetch_domains(BLOCKLIST_TABLE, BLOCKLIST_FIELD, view_or_id=(BLOCKLIST_VIEW_ID or None)))
         except requests.HTTPError as e:
             load_errors.append(str(e)); return set()
-
     if BLOCKLIST_IDS:
         with ThreadPoolExecutor(max_workers=min(8, len(BLOCKLIST_IDS))) as pool:
             for fut in as_completed([pool.submit(load_blocklist, b) for b in BLOCKLIST_IDS]):
                 blocklist_domains.update(fut.result() or set())
-
     st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len([b for b in BLOCKLIST_IDS if b.strip()])}** base(s).")
     if load_errors:
         with st.expander("Blocklist load warnings"):
             for err in load_errors: st.write(f"- {err}")
 
-    # 3) Gambling.com baseline (cache → all-backlinks → refdomains fallback)
+    # 3) Gambling.com baseline (cache → 8 variants of all-backlinks → refdomains)
     st.write("## 3) Gambling.com referring domains (baseline)")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
@@ -334,35 +351,43 @@ def run_pipeline(force_refresh_cache: bool = False):
         t_www   = "www.gambling.com" if "www." not in t_naked else t_naked
         combos = [(t_naked,"domain"), (t_naked,"subdomains"), (t_www,"domain"), (t_www,"subdomains")]
 
-        # Plan A: all-backlinks (url_from only)
-        parts_A, errs_A = [], []
-        with st.spinner("Fetching baseline (all-backlinks)…"):
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futs = [pool.submit(lambda t,m: ah.baseline_all_backlinks(t,m), t, m) for (t,m) in combos]
-                for fut in as_completed(futs):
-                    try: parts_A.append(fut.result())
-                    except Exception as e: errs_A.append(str(e))
-        merged_A = merge_unique(*parts_A)
-        if merged_A:
-            gdc_ref_domains = merged_A
-            baseline_notes.append(f"Baseline via /all-backlinks ({len(merged_A)} domains).")
+        parts, errs = [], []
+        chosen_variant = None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(ah.baseline_all_backlinks_variants, t, m) for (t,m) in combos]
+            for fut in as_completed(futs):
+                try:
+                    doms, note = fut.result()
+                    if doms and not parts:
+                        chosen_variant = note
+                    parts.append(doms)
+                except Exception as e:
+                    errs.append(str(e))
+        merged = merge_unique(*parts)
+        if merged:
+            gdc_ref_domains = merged
+            baseline_notes.append(f"Baseline via {chosen_variant} ({len(merged)} domains).")
         else:
-            # Plan B: refdomains (no order_by, no select)
-            parts_B, errs_B = [], []
-            with st.spinner("Fallback to /refdomains…"):
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    futs = [pool.submit(lambda t,m: ah.baseline_refdomains(t,m), t, m) for (t,m) in combos]
-                    for fut in as_completed(futs):
-                        try: parts_B.append(fut.result())
-                        except Exception as e: errs_B.append(str(e))
-            merged_B = merge_unique(*parts_B)
-            gdc_ref_domains = merged_B
-            if merged_B:
-                baseline_notes.append(f"Baseline via /refdomains ({len(merged_B)} domains).")
-            if errs_A or errs_B:
+            # refdomains fallback
+            parts2, errs2 = [], []
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futs = [pool.submit(ah.baseline_refdomains_relaxed, t, m) for (t,m) in combos]
+                for fut in as_completed(futs):
+                    try:
+                        doms, note = fut.result()
+                        if doms and not parts2:
+                            chosen_variant = note
+                        parts2.append(doms)
+                    except Exception as e:
+                        errs2.append(str(e))
+            merged2 = merge_unique(*parts2)
+            gdc_ref_domains = merged2
+            if merged2:
+                baseline_notes.append(f"Baseline via {chosen_variant} ({len(merged2)} domains).")
+            if errs or errs2:
                 with st.expander("Baseline fetch warnings/errors"):
-                    for e in errs_A: st.write("all-backlinks: " + e)
-                    for e in errs_B: st.write("refdomains: " + e)
+                    for e in errs: st.write(e)
+                    for e in errs2: st.write(e)
 
         if gdc_ref_domains:
             save_ref_domains_to_cache(gambling_domain, gdc_ref_domains)
@@ -375,14 +400,12 @@ def run_pipeline(force_refresh_cache: bool = False):
     # 4) New backlinks per competitor (threaded)
     st.write("## 4) Fetching new backlinks from Ahrefs (last N days)…")
     output_records: List[Dict[str, Any]] = []
-
     def fetch_comp(comp: str) -> List[Dict[str, Any]]:
         try:
             rows = ah.fetch_new_backlinks_last_n_days(comp, days=days, mode="domain")
             return [{"_debug": f"{comp}: {len(rows)} new"}] + rows
         except requests.HTTPError as e:
             return [{"_error": f"{comp}: {e}"}]
-
     if competitors:
         prog = st.progress(0.0); done=0
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
@@ -411,7 +434,7 @@ def run_pipeline(force_refresh_cache: bool = False):
     st.dataframe(df, use_container_width=True)
     st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "exclusive_domains.csv")
 
-# ---------- actions ----------
+# ---------------- actions ----------------
 if run_btn:
     if not (airtable_base_id and airtable_table and AHREFS_TOKEN and AIRTABLE_TOKEN):
         st.error("Please set AIRTABLE_* and AHREFS_API_TOKEN in Secrets or environment.")
@@ -422,4 +445,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("Baseline via /all-backlinks (history=all_time, aggregation=1_per_domain) using url_from only; fallback to /refdomains without order_by or select when needed. New backlinks via /all-backlinks with minimal select. Threaded + pooled HTTP for speed.")
+st.caption("Baseline tries 8 variants of /all-backlinks (varying history, aggregation, and select) and, if still empty, falls back to /refdomains without order_by/select. New backlinks via /all-backlinks with minimal select. Pooled HTTP + threading for speed.")
