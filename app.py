@@ -1,4 +1,4 @@
-# v1.5 — robust baseline variants for Ahrefs v3
+# v1.5.1 — robust baseline variants for Ahrefs v3 (typo fix: history_all_time)
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5",
+        "User-Agent":"gdc-competitor-backlinks/1.5.1",
         "Connection":"keep-alive",
     })
     return sess
@@ -173,8 +173,8 @@ class AhrefsClient:
 
         last_err = None
         for hist, agg, sel in variants:
-            hist_all = (hist == "all_time")
-            params = variant_params(hist_all_time=hist_all, aggregation=agg, with_select=sel)
+            history_all_time = (hist == "all_time")  # ← fixed name
+            params = variant_params(history_all_time=history_all_time, aggregation=agg, with_select=sel)
             note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'}]"
             try:
                 rows = self._paginate(self.EP_BACKLINKS, params)
@@ -183,14 +183,9 @@ class AhrefsClient:
                     return doms, note
             except requests.HTTPError as e:
                 last_err = e
-                # if it's a select/column complaint, continue; else propagate
-                if "select:" in str(e) or "column" in str(e):
-                    continue
-                else:
-                    # keep trying the other variants anyway
-                    continue
+                # continue trying other shapes; many plans reject select/columns
+                continue
         if last_err:
-            # continue to refdomains fallback, but include last error in note
             return [], f"/all-backlinks failed ({str(last_err)[:90]}…)"
 
         return [], "/all-backlinks returned empty in all variants"
@@ -358,7 +353,7 @@ def run_pipeline(force_refresh_cache: bool = False):
             for fut in as_completed(futs):
                 try:
                     doms, note = fut.result()
-                    if doms and not parts:
+                    if doms and not chosen_variant:
                         chosen_variant = note
                     parts.append(doms)
                 except Exception as e:
@@ -368,14 +363,13 @@ def run_pipeline(force_refresh_cache: bool = False):
             gdc_ref_domains = merged
             baseline_notes.append(f"Baseline via {chosen_variant} ({len(merged)} domains).")
         else:
-            # refdomains fallback
             parts2, errs2 = [], []
             with ThreadPoolExecutor(max_workers=4) as pool:
                 futs = [pool.submit(ah.baseline_refdomains_relaxed, t, m) for (t,m) in combos]
                 for fut in as_completed(futs):
                     try:
                         doms, note = fut.result()
-                        if doms and not parts2:
+                        if doms and not chosen_variant:
                             chosen_variant = note
                         parts2.append(doms)
                     except Exception as e:
