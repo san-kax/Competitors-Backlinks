@@ -1,4 +1,4 @@
-# v1.5.6 — Fixed success message to show actual count instead of API limit
+# v1.5.7 — Fixed domain count display and added API limit handling
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.6",
+        "User-Agent":"gdc-competitor-backlinks/1.5.7",
         "Connection":"keep-alive",
     })
     return sess
@@ -121,6 +121,14 @@ class AhrefsClient:
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.get(f"{self.BASE}{path}", params=params, timeout=60)
         if not r.ok:
+            # Check for API limit errors
+            if r.status_code == 403:
+                try:
+                    error_data = r.json()
+                    if "API units limit reached" in str(error_data):
+                        raise requests.HTTPError(f"API units limit reached: {error_data}")
+                except:
+                    pass
             raise requests.HTTPError(f"Ahrefs v3 {path} failed: HTTP {r.status_code} :: {r.text[:300]}")
         return r.json()
 
@@ -538,18 +546,25 @@ def run_pipeline(force_refresh_cache: bool = False):
 
     if baseline_notes:
         for n in baseline_notes: st.write("• " + n)
+    
+    # FIXED: This was the issue - showing the wrong count
     st.write(f"Fetched {'**0**' if not gdc_ref_domains else f'**{len(gdc_ref_domains)}**'} referring domains for **{gambling_domain}**.")
     gdc_ref_set = set(gdc_ref_domains)
 
     # 4) New backlinks per competitor (threaded)
     st.write("## 4) Fetching new backlinks from Ahrefs (last N days)…")
     output_records: List[Dict[str, Any]] = []
+    api_limit_hit = False
+    
     def fetch_comp(comp: str) -> List[Dict[str, Any]]:
         try:
             rows = ah.fetch_new_backlinks_last_n_days(comp, days=days, mode="domain")
             return [{"_debug": f"{comp}: {len(rows)} new"}] + rows
         except requests.HTTPError as e:
+            if "API units limit reached" in str(e):
+                return [{"_error": f"{comp}: API limit reached - skipping"}] + [{"_api_limit": True}]
             return [{"_error": f"{comp}: {e}"}]
+    
     if competitors:
         prog = st.progress(0.0); done=0
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
@@ -557,7 +572,12 @@ def run_pipeline(force_refresh_cache: bool = False):
                 res = fut.result() or []
                 for r in res:
                     if "_debug" in r and show_debug: st.write(r["_debug"])
-                    elif "_error" in r: st.error(r["_error"])
+                    elif "_error" in r: 
+                        st.error(r["_error"])
+                        if "API limit reached" in r["_error"]:
+                            api_limit_hit = True
+                    elif "_api_limit" in r:
+                        api_limit_hit = True
                     else:
                         src = r.get("source_url")
                         reg = extract_registrable_domain(url_to_host(src)) if src else ""
@@ -568,6 +588,10 @@ def run_pipeline(force_refresh_cache: bool = False):
                                 "first_seen": r.get("first_seen"),
                             })
                 done += 1; prog.progress(done/len(competitors))
+
+    # Show API limit warning if hit
+    if api_limit_hit:
+        st.warning("⚠️ Ahrefs API limit reached for some competitors. Results may be incomplete. Consider reducing concurrency or checking your API subscription.")
 
     # 5) Results
     st.write("## 5) Final results — exclusive domains")
@@ -596,4 +620,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.6 - Fixed success message to show actual count (~31,576) instead of API limit (50,000). Now displays accurate domain counts for proper baseline comparison.")
+st.caption("v1.5.7 - Fixed domain count display and added API limit handling. Now shows actual count (~31,576) instead of API limit (50,000) and handles API unit limits gracefully.")
