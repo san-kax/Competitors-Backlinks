@@ -1,4 +1,4 @@
-# v1.5.5 — Fixed to fetch ALL Gambling.com backlinks (31k+) instead of just 100
+# v1.5.6 — Fixed success message to show actual count instead of API limit
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.5",
+        "User-Agent":"gdc-competitor-backlinks/1.5.6",
         "Connection":"keep-alive",
     })
     return sess
@@ -237,8 +237,9 @@ class AhrefsClient:
             rows = self._paginate(self.EP_BACKLINKS, exact_params)
             doms = rows_to_domains(rows)
             if doms:
-                st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
-                return doms, "/all-backlinks [exact Ahrefs interface format - ALL backlinks]"
+                # FIXED: Show actual count instead of API limit
+                st.success(f"✅ Successfully fetched {len(doms)} unique referring domains for Gambling.com baseline")
+                return doms, f"/all-backlinks [exact Ahrefs interface format - {len(doms)} domains]"
         except requests.HTTPError as e:
             st.warning(f"Exact API format failed: {str(e)[:100]}...")
 
@@ -258,8 +259,9 @@ class AhrefsClient:
             rows = self._paginate(self.EP_BACKLINKS, simple_params)
             doms = rows_to_domains(rows)
             if doms:
-                st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
-                return doms, "/all-backlinks [simplified format - ALL backlinks]"
+                # FIXED: Show actual count instead of API limit
+                st.success(f"✅ Successfully fetched {len(doms)} unique referring domains for Gambling.com baseline")
+                return doms, f"/all-backlinks [simplified format - {len(doms)} domains]"
         except requests.HTTPError as e:
             st.warning(f"Simplified format failed: {str(e)[:100]}...")
 
@@ -285,14 +287,15 @@ class AhrefsClient:
         for hist, agg, sel in variants:
             history_all_time = (hist == "all_time")
             params = variant_params(history_all_time=history_all_time, aggregation=agg, with_select=sel)
-            note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'} - ALL backlinks]"
+            note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'}]"
             try:
                 st.info(f"🔄 Trying variant: {note}")
                 rows = self._paginate(self.EP_BACKLINKS, params)
                 doms = rows_to_domains(rows)
                 if doms:
-                    st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
-                    return doms, note
+                    # FIXED: Show actual count instead of API limit
+                    st.success(f"✅ Successfully fetched {len(doms)} unique referring domains for Gambling.com baseline")
+                    return doms, f"{note} - {len(doms)} domains"
             except requests.HTTPError as e:
                 last_err = e
                 continue
@@ -321,7 +324,7 @@ class AhrefsClient:
             if cand:
                 reg = extract_registrable_domain(cand)
                 if reg: out.append(reg)
-        return sorted(set(out)), "/refdomains (no order_by/select - ALL backlinks)"
+        return sorted(set(out)), f"/refdomains (no order_by/select - {len(sorted(set(out)))} domains)"
 
     # New backlinks (last N days) — keep minimal select
     def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
@@ -593,4 +596,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.5 - Fixed to fetch ALL Gambling.com backlinks (31k+) instead of just 100. Now properly compares against complete baseline for accurate exclusive domain detection.")
+st.caption("v1.5.6 - Fixed success message to show actual count (~31,576) instead of API limit (50,000). Now displays accurate domain counts for proper baseline comparison.")
