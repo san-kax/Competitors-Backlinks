@@ -1,4 +1,4 @@
-# v1.5.4 — Fixed API response parsing to handle 'backlinks' array structure
+# v1.5.5 — Fixed to fetch ALL Gambling.com backlinks (31k+) instead of just 100
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.4",
+        "User-Agent":"gdc-competitor-backlinks/1.5.5",
         "Connection":"keep-alive",
     })
     return sess
@@ -126,6 +126,8 @@ class AhrefsClient:
 
     def _paginate(self, path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         out, cursor = [], None
+        total_fetched = 0
+        
         while True:
             q = params.copy()
             if cursor: q["cursor"] = cursor
@@ -133,15 +135,28 @@ class AhrefsClient:
             
             # FIXED: Check for backlinks array first (based on debug output)
             if "backlinks" in data:
-                out.extend(data["backlinks"])
+                batch = data["backlinks"]
+                out.extend(batch)
+                total_fetched += len(batch)
             else:
                 # Fallback to original structure
                 items = data.get("data") or data.get("items") or {}
                 rows = items.get("rows", []) if isinstance(items, dict) else items
                 out.extend(rows)
+                total_fetched += len(rows)
+            
+            # Show progress for large fetches
+            if total_fetched > 1000 and total_fetched % 5000 == 0:
+                st.info(f"📊 Progress: Fetched {total_fetched} backlinks so far...")
             
             cursor = data.get("next") or data.get("cursor")
             if not cursor: break
+            
+            # Safety check to prevent infinite loops
+            if total_fetched > 100000:  # Reasonable upper limit
+                st.warning(f"⚠️ Stopped at {total_fetched} backlinks to prevent timeout")
+                break
+                
         return out
 
     def test_exact_api_call(self, target: str) -> Dict[str, Any]:
@@ -151,11 +166,11 @@ class AhrefsClient:
         if target == "gambling.com":
             target = "www.gambling.com"
         
-        # Exact parameters from the working Ahrefs interface
+        # FIXED: Use higher limit to test the full API capability
         params = {
             "target": f"{target}/",  # www.gambling.com/
             "mode": "subdomains",
-            "limit": 100,
+            "limit": 50000,  # FIXED: Increased from 100
             "history": "all_time", 
             "protocol": "both",
             "aggregation": "1_per_domain",  # Matches "One link per domain" in interface
@@ -204,11 +219,11 @@ class AhrefsClient:
         if target == "gambling.com":
             target = "www.gambling.com"
 
-        # Try the exact working API call first (matching Ahrefs interface)
+        # FIXED: Use the exact working API call but with much higher limit
         exact_params = {
             "target": f"{target}/",  # www.gambling.com/
             "mode": "subdomains",    # Matches interface
-            "limit": 100,            # Match the working example
+            "limit": 50000,          # FIXED: Increased from 100 to handle 31k+ backlinks
             "history": "all_time",
             "protocol": "both",
             "aggregation": "1_per_domain",  # Matches "One link per domain"
@@ -218,18 +233,20 @@ class AhrefsClient:
         }
         
         try:
+            st.info("🔄 Fetching ALL Gambling.com backlinks (this may take a moment for 31k+ results)...")
             rows = self._paginate(self.EP_BACKLINKS, exact_params)
             doms = rows_to_domains(rows)
             if doms:
-                return doms, "/all-backlinks [exact Ahrefs interface format]"
+                st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
+                return doms, "/all-backlinks [exact Ahrefs interface format - ALL backlinks]"
         except requests.HTTPError as e:
             st.warning(f"Exact API format failed: {str(e)[:100]}...")
 
-        # Fallback to simplified format
+        # Fallback to simplified format with higher limit
         simple_params = {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 1000,
+            "limit": 50000,  # FIXED: Increased from 1000
             "history": "all_time",
             "protocol": "both",
             "aggregation": "1_per_domain",
@@ -237,19 +254,21 @@ class AhrefsClient:
         }
         
         try:
+            st.info("🔄 Trying simplified format for ALL Gambling.com backlinks...")
             rows = self._paginate(self.EP_BACKLINKS, simple_params)
             doms = rows_to_domains(rows)
             if doms:
-                return doms, "/all-backlinks [simplified format]"
+                st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
+                return doms, "/all-backlinks [simplified format - ALL backlinks]"
         except requests.HTTPError as e:
             st.warning(f"Simplified format failed: {str(e)[:100]}...")
 
-        # Final fallback to original variants
+        # Final fallback to original variants with higher limits
         def variant_params(history_all_time: bool, aggregation: bool, with_select: bool):
             p = {
                 "target": f"{target}/",
                 "mode": "subdomains",
-                "limit": 1000,
+                "limit": 50000,  # FIXED: Increased from 1000
                 "history": "all_time" if history_all_time else "since:2000-01-01",
                 "protocol": "both",
             }
@@ -266,11 +285,13 @@ class AhrefsClient:
         for hist, agg, sel in variants:
             history_all_time = (hist == "all_time")
             params = variant_params(history_all_time=history_all_time, aggregation=agg, with_select=sel)
-            note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'}]"
+            note = f"/all-backlinks [{hist}; agg={'on' if agg else 'off'}; select={'url_from' if sel else 'none'} - ALL backlinks]"
             try:
+                st.info(f"🔄 Trying variant: {note}")
                 rows = self._paginate(self.EP_BACKLINKS, params)
                 doms = rows_to_domains(rows)
                 if doms:
+                    st.success(f"✅ Successfully fetched {len(doms)} referring domains for Gambling.com baseline")
                     return doms, note
             except requests.HTTPError as e:
                 last_err = e
@@ -288,7 +309,7 @@ class AhrefsClient:
         params = { 
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 1000 
+            "limit": 50000  # FIXED: Increased from 1000
         }
         try:
             rows = self._paginate(self.EP_REFDOMAINS, params)
@@ -300,7 +321,7 @@ class AhrefsClient:
             if cand:
                 reg = extract_registrable_domain(cand)
                 if reg: out.append(reg)
-        return sorted(set(out)), "/refdomains (no order_by/select)"
+        return sorted(set(out)), "/refdomains (no order_by/select - ALL backlinks)"
 
     # New backlinks (last N days) — keep minimal select
     def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
@@ -572,4 +593,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.4 - Fixed API response parsing to handle 'backlinks' array structure. Now correctly parses the actual Ahrefs API response format and should show the correct number of backlinks found.") 
+st.caption("v1.5.5 - Fixed to fetch ALL Gambling.com backlinks (31k+) instead of just 100. Now properly compares against complete baseline for accurate exclusive domain detection.")
