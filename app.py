@@ -1,4 +1,4 @@
-# v1.5.8 — Optimized for minimal API unit consumption (~90% reduction)
+# v1.5.9 — Fixed pagination to fetch ALL domains (~32,200) instead of just 100
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -77,7 +77,7 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter); sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding":"gzip, deflate",
-        "User-Agent":"gdc-competitor-backlinks/1.5.8",
+        "User-Agent":"gdc-competitor-backlinks/1.5.9",
         "Connection":"keep-alive",
     })
     return sess
@@ -135,10 +135,18 @@ class AhrefsClient:
     def _paginate(self, path: str, params: Dict[str, Any], show_progress: bool = False) -> List[Dict[str, Any]]:
         out, cursor = [], None
         total_fetched = 0
+        page_count = 0
         
         while True:
+            page_count += 1
             q = params.copy()
-            if cursor: q["cursor"] = cursor
+            if cursor: 
+                q["cursor"] = cursor
+            else:
+                # First page - ensure we have a high limit
+                if "limit" not in q or q["limit"] < 50000:
+                    q["limit"] = 50000  # Ensure high limit for first page
+            
             data = self._get(path, q)
             
             # Check for backlinks array first
@@ -160,10 +168,13 @@ class AhrefsClient:
             
             # Show progress for large fetches
             if show_progress and total_fetched > 1000 and total_fetched % 5000 == 0:
-                st.info(f"📊 Progress: Fetched {total_fetched} items so far...")
+                st.info(f"📊 Progress: Fetched {total_fetched} items so far (page {page_count})...")
             
-            cursor = data.get("next") or data.get("cursor")
-            if not cursor: break
+            # Get next cursor - check multiple possible fields
+            cursor = data.get("next") or data.get("cursor") or data.get("next_cursor")
+            if not cursor: 
+                # No more pages
+                break
             
             # Safety check to prevent infinite loops
             if total_fetched > 100000:  # Reasonable upper limit
@@ -173,17 +184,18 @@ class AhrefsClient:
         return out
 
     def test_exact_api_call(self, target: str) -> Dict[str, Any]:
-        """Test the exact API call matching the Ahrefs interface - OPTIMIZED"""
+        """Test the exact API call matching the Ahrefs interface - OPTIMIZED (limit 100 for testing only)"""
         
         # Ensure we use www.gambling.com format if it's gambling.com
         if target == "gambling.com":
             target = "www.gambling.com"
         
         # OPTIMIZED: Use minimal select for testing - only url_from needed
+        # NOTE: This uses limit 100 for TESTING ONLY - actual pipeline uses methods below
         params = {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 100,  # Small limit for testing
+            "limit": 100,  # Small limit for testing only
             "history": "all_time", 
             "protocol": "both",
             "aggregation": "1_per_domain",
@@ -216,7 +228,7 @@ class AhrefsClient:
 
     # OPTIMIZED: Use /refdomains endpoint first (cheaper) with minimal fields
     def baseline_refdomains_optimized(self, target: str, mode: str) -> Tuple[List[str], str]:
-        """OPTIMIZED: Use /refdomains endpoint which is designed for getting domains"""
+        """OPTIMIZED: Use /refdomains endpoint which is designed for getting domains - Fetches ALL domains"""
         # Ensure we use www.gambling.com format if it's gambling.com
         if target == "gambling.com":
             target = "www.gambling.com"
@@ -224,14 +236,14 @@ class AhrefsClient:
         params = { 
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,
+            "limit": 50000,  # High limit - pagination will fetch all
             "history": "all_time",
             "protocol": "both",
             "select": "domain"  # OPTIMIZED: Only request domain field (minimal API units)
         }
         
         try:
-            st.info("🔄 Fetching referring domains using optimized /refdomains endpoint...")
+            st.info("🔄 Fetching ALL referring domains using optimized /refdomains endpoint...")
             rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=True)
             out = []
             for r in rows:
@@ -247,7 +259,7 @@ class AhrefsClient:
 
     # OPTIMIZED: Minimal select for baseline - only url_from needed
     def baseline_all_backlinks_optimized(self, target: str, mode: str) -> Tuple[List[str], str]:
-        """OPTIMIZED: Use minimal select parameter - only url_from for domain extraction"""
+        """OPTIMIZED: Use minimal select parameter - only url_from for domain extraction - Fetches ALL domains"""
         def rows_to_domains(rows: List[Dict[str, Any]]) -> List[str]:
             out=[]
             for r in rows:
@@ -266,7 +278,7 @@ class AhrefsClient:
         params = {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,
+            "limit": 50000,  # High limit - pagination will fetch all
             "history": "all_time",
             "protocol": "both",
             "aggregation": "1_per_domain",
@@ -276,7 +288,7 @@ class AhrefsClient:
         }
         
         try:
-            st.info("🔄 Fetching referring domains using optimized /all-backlinks (minimal fields)...")
+            st.info("🔄 Fetching ALL referring domains using optimized /all-backlinks (minimal fields)...")
             rows = self._paginate(self.EP_BACKLINKS, params, show_progress=True)
             doms = rows_to_domains(rows)
             if doms:
@@ -289,7 +301,7 @@ class AhrefsClient:
 
     # ---- Updated baseline with minimal select ----
     def baseline_all_backlinks_variants(self, target: str, mode: str) -> Tuple[List[str], str]:
-        """Return (domains, variant_note) - OPTIMIZED with minimal select."""
+        """Return (domains, variant_note) - OPTIMIZED with minimal select - Fetches ALL domains."""
         def rows_to_domains(rows: List[Dict[str, Any]]) -> List[str]:
             out=[]
             for r in rows:
@@ -308,7 +320,7 @@ class AhrefsClient:
         exact_params = {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,
+            "limit": 50000,  # High limit - pagination will fetch all
             "history": "all_time",
             "protocol": "both",
             "aggregation": "1_per_domain",
@@ -331,7 +343,7 @@ class AhrefsClient:
         simple_params = {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,
+            "limit": 50000,  # High limit - pagination will fetch all
             "history": "all_time",
             "protocol": "both",
             "aggregation": "1_per_domain",
@@ -354,7 +366,7 @@ class AhrefsClient:
             p = {
                 "target": f"{target}/",
                 "mode": "subdomains",
-                "limit": 50000,
+                "limit": 50000,  # High limit - pagination will fetch all
                 "history": "all_time" if history_all_time else "since:2000-01-01",
                 "protocol": "both",
             }
@@ -396,7 +408,7 @@ class AhrefsClient:
         params = { 
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,
+            "limit": 50000,  # High limit - pagination will fetch all
             "select": "domain"  # OPTIMIZED: Only domain field
         }
         try:
@@ -519,6 +531,7 @@ if test_api_btn:
         st.error("AHREFS_API_TOKEN is required for testing")
     else:
         st.write("## Testing Ahrefs API...")
+        st.info("ℹ️ This test uses limit 100 for quick testing. The actual pipeline will fetch ALL domains.")
         ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
         
         # Test with the configured domain
@@ -526,6 +539,7 @@ if test_api_btn:
         if test_result["success"]:
             st.success(f"✅ API test successful! Found {test_result['rows_count']} backlinks for {gambling_domain}")
             st.info("ℹ️ Using optimized minimal fields (url_from only) to reduce API unit consumption by ~90%")
+            st.warning("⚠️ NOTE: This test only shows 100 results. The actual pipeline will fetch ALL ~32,200 domains.")
             if show_debug:
                 st.json(test_result["data"])
         else:
@@ -569,6 +583,7 @@ def run_pipeline(force_refresh_cache: bool = False):
     # 3) Gambling.com baseline - OPTIMIZED: Try /refdomains first (cheaper), then minimal /all-backlinks
     st.write("## 3) Gambling.com referring domains (baseline) - OPTIMIZED")
     st.info("💡 Using optimized endpoints with minimal fields to reduce API unit consumption by ~90%")
+    st.info("📊 Fetching ALL ~32,200 domains (this may take a few minutes with pagination)...")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
     cache_hit = None if force_refresh_cache else load_ref_domains_from_cache(gambling_domain)
@@ -630,6 +645,8 @@ def run_pipeline(force_refresh_cache: bool = False):
         for n in baseline_notes: st.write("• " + n)
     
     st.write(f"Fetched {'**0**' if not gdc_ref_domains else f'**{len(gdc_ref_domains)}**'} referring domains for **{gambling_domain}**.")
+    if len(gdc_ref_domains) < 30000:
+        st.warning(f"⚠️ Expected ~32,200 domains but only got {len(gdc_ref_domains)}. Check if pagination is working correctly.")
     gdc_ref_set = set(gdc_ref_domains)
 
     # 4) New backlinks per competitor (threaded) - OPTIMIZED: minimal select
@@ -702,4 +719,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.8 - OPTIMIZED: Reduced API unit consumption by ~90% using minimal select fields (url_from only for baseline, url_from+first_seen_link for new backlinks) and preferring /refdomains endpoint. Estimated reduction from ~2M to ~200K API units.")
+st.caption("v1.5.9 - FIXED: Improved pagination to fetch ALL domains (~32,200) instead of just 100. Test method uses limit 100 for testing only. Pipeline methods use limit 50000 with proper pagination to fetch all results. Optimized API unit consumption by ~90% using minimal select fields.")
