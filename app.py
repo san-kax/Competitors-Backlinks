@@ -882,99 +882,12 @@ def run_pipeline(force_refresh_cache: bool = False):
     if api_limit_hit:
         st.warning("⚠️ Ahrefs API limit reached for some competitors. Results may be incomplete. Consider reducing concurrency or checking your API subscription.")
 
-    # 5) Enrich with DR and Traffic data
-    if output_records:
-        st.write("## 5) Fetching DR and Traffic data for linking domains…")
-        unique_domains = sorted(set(r["linking_domain"] for r in output_records))
-        st.info(f"📊 Fetching DR and Traffic for {len(unique_domains)} unique linking domains...")
-        
-        def fetch_domain_metrics(domain: str) -> Dict[str, Optional[int]]:
-            """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
-            try:
-                # Use /refdomains endpoint - query the domain itself to get its metrics
-                params = {
-                    "target": f"{domain}/",
-                    "mode": "domain",
-                    "limit": 1,
-                    "select": "domain,domain_rating,traffic",
-                }
-                result = ah._get(ah.EP_REFDOMAINS, params)
-                
-                # Parse response - check if target domain metrics are in metadata or response
-                dr = None
-                traffic = None
-                
-                # Check metadata/target fields first
-                if isinstance(result, dict):
-                    meta = result.get("meta") or result.get("target") or {}
-                    dr = meta.get("domain_rating") or meta.get("dr") or result.get("domain_rating") or result.get("dr")
-                    traffic = meta.get("traffic") or meta.get("organic_traffic") or result.get("traffic") or result.get("organic_traffic")
-                
-                # If not in metadata, check rows (though /refdomains returns referring domains, not target)
-                if dr is None or traffic is None:
-                    rows = []
-                    if "referring_domains" in result:
-                        rows = result["referring_domains"]
-                    elif "data" in result:
-                        if isinstance(result["data"], list):
-                            rows = result["data"]
-                        elif "rows" in result["data"]:
-                            rows = result["data"]["rows"]
-                    elif "rows" in result:
-                        rows = result["rows"]
-                    
-                    # Look for the domain in results (unlikely but check)
-                    for r in rows:
-                        if isinstance(r, dict):
-                            row_domain = r.get("domain") or r.get("referring_domain")
-                            if row_domain and extract_registrable_domain(row_domain) == domain:
-                                dr = r.get("domain_rating") or r.get("dr") or dr
-                                traffic = r.get("traffic") or r.get("organic_traffic") or traffic
-                                break
-                
-                return {
-                    "dr": int(dr) if isinstance(dr, (int, float)) and dr > 0 else None,
-                    "traffic": int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None
-                }
-            except Exception as e:
-                # If fetch fails, return None values
-                return {"dr": None, "traffic": None}
-        
-        # Fetch metrics for all unique domains (with progress)
-        domain_metrics = {}
-        if len(unique_domains) > 0:
-            prog_metrics = st.progress(0.0)
-            with ThreadPoolExecutor(max_workers=min(10, len(unique_domains))) as pool:
-                futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
-                done = 0
-                for fut in as_completed(futures):
-                    domain = futures[fut]
-                    domain_metrics[domain] = fut.result()
-                    done += 1
-                    prog_metrics.progress(done / len(unique_domains))
-            
-            # Add DR and Traffic to output records
-            for record in output_records:
-                domain = record["linking_domain"]
-                metrics = domain_metrics.get(domain, {})
-                record["dr"] = metrics.get("dr")
-                record["traffic"] = metrics.get("traffic")
-            
-            fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
-            if fetched_count > 0:
-                st.success(f"✅ Fetched DR/Traffic for {fetched_count}/{len(unique_domains)} domains")
-            else:
-                st.warning("⚠️ Could not fetch DR/Traffic data. The API endpoint may not support individual domain queries.")
-    
-    # 6) Results
-    st.write("## 6) Final results — exclusive domains")
+    # 5) Results
+    st.write("## 5) Final results — exclusive domains")
     if not output_records:
         st.success("No exclusive domains found after filtering out Gambling.com baseline and excluded databases.")
         return
     df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["linking_domain"])
-    # Reorder columns: linking_domain, dr, traffic, source_url, first_seen
-    column_order = ["linking_domain", "dr", "traffic", "source_url", "first_seen"]
-    df = df[[col for col in column_order if col in df.columns]]
     st.dataframe(df, use_container_width=True)
     st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "exclusive_domains.csv")
 
