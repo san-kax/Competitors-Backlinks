@@ -432,13 +432,13 @@ class AhrefsClient:
     def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
         """ULTRA-OPTIMIZED: Single API call with minimal fields and aggregation to minimize API credits"""
         start_iso, end_iso = iso_window_last_n_days(days)
-        # Filter: DR30+ and Traffic 3000+ for quality backlinks
+        # Filter: Date range and live links only
+        # NOTE: DR and Traffic filters may not be available in where clause for /all-backlinks endpoint
+        # We'll filter client-side after fetching, or use /refdomains endpoint which supports these filters
         where_obj = {"and":[
             {"field":"first_seen_link","is":["gte",start_iso]},
             {"field":"first_seen_link","is":["lte",end_iso]},
-            {"field":"last_seen","is":"is_null"},
-            {"field":"domain_rating","is":["gte",30]},  # DR30+
-            {"field":"traffic","is":["gte",3000]}  # Traffic 3000+
+            {"field":"last_seen","is":"is_null"}
         ]}
         # ULTRA-OPTIMIZED for minimum API credits:
         # 1. Minimal select: only url_from and first_seen_link (2 fields vs 30+ = ~93% reduction)
@@ -453,13 +453,22 @@ class AhrefsClient:
             "order_by": "traffic:desc",  # Get best results first
             "aggregation": "1_per_domain",  # CRITICAL: Reduces duplicates = fewer API units
             "protocol":"both",
-            "select": "url_from,first_seen_link",  # ULTRA-OPTIMIZED: Only 2 fields (minimal cost)
+            "select": "url_from,first_seen_link,dr,traffic",  # Need dr and traffic for client-side filtering
             "where": json.dumps(where_obj),
         })
         out=[]
         for r in rows:
             uf = r.get("url_from"); fs = r.get("first_seen_link")
-            if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
+            # Get DR and Traffic values (try multiple field name variations)
+            dr = r.get("dr") or r.get("domain_rating") or r.get("domain_rating_value") or 0
+            traffic = r.get("traffic") or r.get("organic_traffic") or r.get("traffic_value") or 0
+            # Client-side filtering: DR30+ and Traffic 3000+
+            if isinstance(dr, (int, float)) and isinstance(traffic, (int, float)):
+                if dr >= 30 and traffic >= 3000:
+                    if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
+            else:
+                # If DR/traffic not available, include all results (fallback)
+                if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
         return out
 
 # ---------------- cache ----------------
@@ -750,10 +759,10 @@ def run_pipeline(force_refresh_cache: bool = False):
     # 4) New backlinks per competitor (threaded) - ULTRA-OPTIMIZED: minimum API credits
     st.write("## 4) Fetching new backlinks from Ahrefs (last N days) - ULTRA-OPTIMIZED")
     st.info("💡 **API Credit Optimizations:**")
-    st.info("   • Minimal fields: Only `url_from` and `first_seen_link` (2 fields vs 30+ = ~93% reduction)")
+    st.info("   • Minimal fields: Only `url_from`, `first_seen_link`, `dr`, `traffic` (4 fields vs 30+ = ~87% reduction)")
     st.info("   • Aggregation: `1_per_domain` reduces duplicates = fewer API units consumed")
-    st.info("   • Server-side filtering: DR/Traffic filters applied without selecting those fields")
-    st.info("🎯 Quality filters: DR30+ and Traffic 3000+ only")
+    st.info("   • Client-side filtering: DR30+ and Traffic 3000+ filters applied after fetch")
+    st.info("🎯 Quality filters: DR30+ and Traffic 3000+ only (applied client-side)")
     output_records: List[Dict[str, Any]] = []
     api_limit_hit = False
     
