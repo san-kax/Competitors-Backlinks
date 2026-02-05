@@ -491,27 +491,74 @@ class AhrefsClient:
         qualifying_domains = None
         
         # Step 2: Fetch backlinks for date range
+        # Simplify where clause - use history parameter for date filtering instead
         where_obj = {"and":[
-            {"field":"first_seen_link","is":["gte",start_iso]},
-            {"field":"first_seen_link","is":["lte",end_iso]},
-            {"field":"last_seen","is":"is_null"}
+            {"field":"last_seen","is":"is_null"}  # Live links only
         ]}
         
+        if show_debug:
+            st.info(f"🔍 {target}: Fetching backlinks from {start_iso[:10]} to {end_iso[:10]} (last {days} days)")
+            st.write(f"   Date range: {start_iso} to {end_iso}")
+        
         try:
+            # Try with both history parameter AND where clause date filters
+            # Some APIs need both, some prefer one or the other
+            where_obj_with_date = {"and":[
+                {"field":"last_seen","is":"is_null"},  # Live links only
+                {"field":"first_seen_link","is":["gte",start_iso]},  # Date filter in where clause
+                {"field":"first_seen_link","is":["lte",end_iso]}
+            ]}
+            
             rows = self._paginate(self.EP_BACKLINKS, {
                 "target": f"{target}/",
                 "mode": "subdomains",
                 "limit": 50000,
-                "history": f"since:{start_iso[:10]}",
+                "history": f"since:{start_iso[:10]}",  # Use history parameter for date filtering
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol":"both",
                 "select": "url_from,first_seen_link,domain_rating_source,traffic_source",  # Try source domain metrics
-                "where": json.dumps(where_obj),
+                "where": json.dumps(where_obj_with_date),  # Use where clause with date filters
             })
             
             if show_debug:
-                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API")
+                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
+                if rows:
+                    # Show sample dates to debug
+                    sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
+                    st.write(f"   Sample first_seen dates: {sample_dates}")
+            
+            # Filter by date client-side to ensure we only get backlinks in our date range
+            # The history parameter might return more than we need
+            if rows:
+                filtered_rows = []
+                date_parse_errors = 0
+                for r in rows:
+                    fs = r.get("first_seen_link")
+                    if fs:
+                        try:
+                            # Parse ISO date and check if it's in our range
+                            fs_str = fs.replace("Z", "+00:00")
+                            fs_dt = datetime.fromisoformat(fs_str)
+                            start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                            if start_dt <= fs_dt <= end_dt:
+                                filtered_rows.append(r)
+                        except Exception as parse_err:
+                            # If date parsing fails, include the row anyway (better to include than exclude)
+                            date_parse_errors += 1
+                            if show_debug and date_parse_errors <= 3:
+                                st.write(f"⚠️ Could not parse date '{fs}': {str(parse_err)[:50]}")
+                            filtered_rows.append(r)
+                    else:
+                        # If no first_seen_link, exclude it (we need dates for filtering)
+                        if show_debug:
+                            st.write(f"⚠️ Backlink missing first_seen_link field")
+                rows = filtered_rows
+                if show_debug:
+                    st.info(f"📅 {target}: After date filtering ({start_iso[:10]} to {end_iso[:10]}): {len(rows)} backlinks")
+                    if date_parse_errors > 0:
+                        st.warning(f"⚠️ {date_parse_errors} backlinks had date parsing issues")
             
             # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
             out = []
