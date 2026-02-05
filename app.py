@@ -484,21 +484,10 @@ class AhrefsClient:
         """ULTRA-OPTIMIZED: Two-step approach - get qualifying domains first, then fetch their backlinks"""
         start_iso, end_iso = iso_window_last_n_days(days)
         
-        # Step 1: Try to get domains that meet DR30+ and Traffic 3000+ criteria
-        qualifying_domains, error_msg = self.fetch_qualifying_refdomains(target, days, show_debug=show_debug)
-        
-        # If DR/Traffic filters fail, fallback to fetching all backlinks
-        use_quality_filter = True
-        if error_msg:
-            if show_debug:
-                st.warning(f"⚠️ {target}: Quality filter failed ({error_msg[:150]}). Fetching all new backlinks.")
-            use_quality_filter = False
-            qualifying_domains = None
-        elif not qualifying_domains:
-            if show_debug:
-                st.info(f"ℹ️ {target}: No domains found with DR30+ and Traffic 3000+ in last {days} days. Fetching all new backlinks.")
-            use_quality_filter = False
-            qualifying_domains = None
+        # DISABLED quality filter for now - fetch all new backlinks
+        # Quality filtering can be re-enabled later if needed
+        use_quality_filter = False
+        qualifying_domains = None
         
         # Step 2: Fetch backlinks for date range
         where_obj = {"and":[
@@ -516,7 +505,7 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol":"both",
-                "select": "url_from,first_seen_link,domain_rating,traffic",  # Try to get DR/Traffic from backlinks
+                "select": "url_from,first_seen_link",  # Minimal fields - DR/Traffic not available in /all-backlinks
                 "where": json.dumps(where_obj),
             })
             
@@ -884,8 +873,6 @@ def run_pipeline(force_refresh_cache: bool = False):
                                 "linking_domain": reg,
                                 "source_url": src,
                                 "first_seen": r.get("first_seen"),
-                                "dr": r.get("dr"),  # Already extracted from backlinks if available
-                                "traffic": r.get("traffic"),  # Already extracted from backlinks if available
                             })
                 done += 1; prog.progress(done/len(competitors))
 
