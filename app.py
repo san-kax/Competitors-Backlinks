@@ -1,16 +1,13 @@
-# v2.1.0 — FIXED & OPTIMIZED for minimum Ahrefs API credits:
-#   • Single /refdomains call with server-side DR30+/Traffic3000+ filters (vs two-step approach)
-#   • DR and Traffic included in output (fetched in same call - no extra credits)
+# v3.0.1 — BATCH ANALYSIS API for maximum efficiency:
+#   • Uses /batch-analysis endpoint to get DR/Traffic for many domains in ONE call
+#   • Fetches new backlinks per competitor, collects unique domains
+#   • Single batch call for metrics (vs individual calls per domain)
 #   • Parallel Airtable fetches (competitors + blocklists simultaneously)
-#   • In-memory domain metrics cache to avoid duplicate lookups
-#   • Early filtering against blocklist before API calls
 #   • Optimized connection pooling and timeouts
-#   • Streamlined pagination with higher limits
 
 import os
 import json
 import sqlite3
-import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,35 +73,27 @@ def sanitize_target_for_ahrefs(val: str) -> Optional[str]:
     reg = extract_registrable_domain(s)
     return s if reg else None
 
-def merge_unique(*lists: List[str]) -> List[str]:
-    """Merge multiple lists into sorted unique set."""
-    s: Set[str] = set()
-    for lst in lists:
-        if lst:
-            s.update(lst)
-    return sorted(s)
-
 def make_session(pool_size: int = 100) -> requests.Session:
     """Create optimized HTTP session with connection pooling."""
     sess = requests.Session()
     retries = Retry(
         total=5,
-        backoff_factor=0.3,  # Faster backoff
+        backoff_factor=0.3,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=["GET"],
+        allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
     adapter = HTTPAdapter(
         max_retries=retries,
         pool_connections=pool_size,
         pool_maxsize=pool_size,
-        pool_block=False  # Don't block when pool is full
+        pool_block=False
     )
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
     sess.headers.update({
         "Accept-Encoding": "gzip, deflate, br",
-        "User-Agent": "gdc-competitor-backlinks/2.0.0",
+        "User-Agent": "gdc-competitor-backlinks/3.0.0",
         "Connection": "keep-alive",
     })
     return sess
@@ -145,19 +134,20 @@ class AirtableClient:
                 break
         return sorted(set(rows))
 
-# ---------------- Ahrefs Client v2.0 - Maximum Optimization ----------------
+# ---------------- Ahrefs Client v3.0 - Batch Analysis API ----------------
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     EP_BACKLINKS = "/site-explorer/all-backlinks"
     EP_REFDOMAINS = "/site-explorer/refdomains"
+    EP_BATCH_ANALYSIS = "/batch-analysis/batch-analysis"
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
         self.session = session or make_session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         })
-        # In-memory cache for domain metrics (DR, Traffic)
         self._domain_metrics_cache: Dict[str, Dict[str, Any]] = {}
 
     def _get(self, path: str, params: Dict[str, Any], timeout: int = 90) -> Dict[str, Any]:
@@ -174,9 +164,23 @@ class AhrefsClient:
             raise requests.HTTPError(f"Ahrefs v3 {path} failed: HTTP {r.status_code} :: {r.text[:300]}")
         return r.json()
 
+    def _post(self, path: str, json_data: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
+        """Execute POST request with error handling."""
+        r = self.session.post(f"{self.BASE}{path}", json=json_data, timeout=timeout)
+        if not r.ok:
+            if r.status_code == 403:
+                try:
+                    error_data = r.json()
+                    if "API units limit reached" in str(error_data):
+                        raise requests.HTTPError(f"API units limit reached: {error_data}")
+                except json.JSONDecodeError:
+                    pass
+            raise requests.HTTPError(f"Ahrefs v3 POST {path} failed: HTTP {r.status_code} :: {r.text[:500]}")
+        return r.json()
+
     def _paginate(self, path: str, params: Dict[str, Any],
                   max_items: int = 200000, show_progress: bool = False) -> List[Dict[str, Any]]:
-        """Paginate through API results with optimized settings."""
+        """Paginate through API results."""
         out, cursor = [], None
         total_fetched = 0
         page_count = 0
@@ -189,7 +193,6 @@ class AhrefsClient:
 
             data = self._get(path, q)
 
-            # Handle different response structures
             if "backlinks" in data:
                 batch = data["backlinks"]
             elif "referring_domains" in data:
@@ -211,10 +214,7 @@ class AhrefsClient:
         return out
 
     def get_baseline_domains(self, target: str) -> Tuple[List[str], str]:
-        """
-        OPTIMIZED: Get baseline referring domains using /refdomains endpoint.
-        Only fetches 'domain' field - minimum API credits.
-        """
+        """Get baseline referring domains using /refdomains endpoint."""
         if target == "gambling.com":
             target = "www.gambling.com"
 
@@ -224,11 +224,11 @@ class AhrefsClient:
             "limit": 50000,
             "history": "all_time",
             "protocol": "both",
-            "select": "domain"  # MINIMAL: Only domain field
+            "select": "domain"
         }
 
         try:
-            st.info("🔄 Fetching baseline referring domains (optimized single-field query)...")
+            st.info("🔄 Fetching baseline referring domains...")
             rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=True)
             domains = []
             for r in rows:
@@ -239,34 +239,110 @@ class AhrefsClient:
                         domains.append(reg)
             unique_domains = sorted(set(domains))
             st.success(f"✅ Fetched {len(unique_domains):,} baseline domains")
-            return unique_domains, f"/refdomains [optimized - {len(unique_domains):,} domains]"
+            return unique_domains, f"/refdomains [{len(unique_domains):,} domains]"
         except requests.HTTPError as e:
             return [], f"/refdomains failed ({str(e)[:90]}…)"
 
-    def fetch_new_backlinks_with_metrics(
+    def batch_get_domain_metrics(
+        self,
+        domains: List[str],
+        batch_size: int = 100,
+        show_debug: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        BATCH ANALYSIS API: Get DR and Traffic for multiple domains in batches.
+
+        This is MUCH more efficient than individual calls.
+        Max 100 domains per batch per API docs.
+        """
+        # Enforce API limit
+        batch_size = min(batch_size, 100)
+        if not domains:
+            return {}
+
+        results: Dict[str, Dict[str, Any]] = {}
+        total_batches = (len(domains) + batch_size - 1) // batch_size
+
+        for i in range(0, len(domains), batch_size):
+            batch = domains[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+
+            if show_debug:
+                st.info(f"📊 Batch {batch_num}/{total_batches}: Processing {len(batch)} domains...")
+
+            # Build targets for batch analysis
+            # API requires: url (required), mode (required), protocol (required)
+            targets = []
+            for domain in batch:
+                targets.append({
+                    "url": f"https://{domain}",
+                    "mode": "subdomains",  # exact, prefix, domain, or subdomains
+                    "protocol": "both"  # both, http, or https
+                })
+
+            payload = {
+                "targets": targets,
+                "select": ["url", "domain_rating", "org_traffic"],
+                "volume_mode": "monthly",
+                "output": "json"
+            }
+
+            try:
+                response = self._post(self.EP_BATCH_ANALYSIS, payload)
+
+                # Parse response - structure is {"targets": [...]}
+                targets_data = response.get("targets", [])
+                for item in targets_data:
+                    url = item.get("url", "")
+                    # Extract domain from URL
+                    domain = extract_registrable_domain(url_to_host(url))
+                    if domain:
+                        dr = item.get("domain_rating", 0)
+                        traffic = item.get("org_traffic", 0)
+
+                        # Handle None/null values
+                        try:
+                            dr = int(dr) if dr is not None else 0
+                            traffic = int(traffic) if traffic is not None else 0
+                        except (ValueError, TypeError):
+                            dr = 0
+                            traffic = 0
+
+                        results[domain] = {
+                            "dr": dr,
+                            "traffic": traffic
+                        }
+                        # Also cache it
+                        self._domain_metrics_cache[domain] = results[domain]
+
+            except requests.HTTPError as e:
+                if show_debug:
+                    st.warning(f"⚠️ Batch {batch_num} failed: {str(e)[:100]}")
+                # On failure, set defaults for this batch
+                for domain in batch:
+                    if domain not in results:
+                        results[domain] = {"dr": 0, "traffic": 0}
+
+        if show_debug:
+            st.success(f"✅ Got metrics for {len(results)} domains via Batch Analysis API")
+
+        return results
+
+    def fetch_new_backlinks_raw(
         self,
         target: str,
         days: int,
-        min_dr: int = 30,
-        min_traffic: int = 3000,
         show_debug: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        FIXED & OPTIMIZED: Fetch new backlinks first, then filter by DR/Traffic.
-
-        Strategy (corrected):
-        1. Fetch ALL new backlinks from date range
-        2. Include DR/Traffic data if available from API
-        3. Apply filter only if DR/Traffic data is actually present
-
-        This ensures we don't miss new backlinks.
+        Fetch new backlinks for a competitor (raw data, no filtering).
+        Returns list of {source_url, first_seen, domain}
         """
         start_iso, end_iso = iso_window_last_n_days(days)
 
         if target == "gambling.com":
             target = "www.gambling.com"
 
-        # Fetch new backlinks with date filter
         where_obj = {
             "and": [
                 {"field": "first_seen_link", "is": ["gte", start_iso]},
@@ -284,124 +360,12 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol": "both",
-                # Request all potentially useful fields
-                "select": "url_from,first_seen_link,domain_rating_source,traffic_domain",
+                "select": "url_from,first_seen_link",
                 "where": json.dumps(where_obj),
             })
 
-            if show_debug:
-                st.info(f"📊 {target}: Found {len(rows)} new backlinks in date range")
-                # Debug: show first row structure
-                if rows:
-                    st.write(f"🔍 Sample row keys: {list(rows[0].keys())}")
-
-            if not rows:
-                return []
-
-            # Process results
-            results = []
-            has_dr_data = False
-
-            for r in rows:
-                url = r.get("url_from")
-                if not url:
-                    continue
-
-                host = url_to_host(url)
-                reg = extract_registrable_domain(host)
-                if not reg:
-                    continue
-
-                # Get DR and Traffic - try multiple field names
-                dr = r.get("domain_rating_source") or r.get("domain_rating") or r.get("dr")
-                traffic = r.get("traffic_domain") or r.get("traffic") or r.get("organic_traffic")
-
-                # Convert to int safely
-                try:
-                    dr = int(dr) if dr is not None else None
-                    traffic = int(traffic) if traffic is not None else None
-                except (ValueError, TypeError):
-                    dr = None
-                    traffic = None
-
-                # Track if we have any DR data
-                if dr is not None and dr > 0:
-                    has_dr_data = True
-
-                # If we have DR/Traffic data, apply filter
-                # If no DR/Traffic data available, include all results
-                if dr is not None and traffic is not None:
-                    if dr >= min_dr and traffic >= min_traffic:
-                        results.append({
-                            "source_url": url,
-                            "first_seen": r.get("first_seen_link"),
-                            "domain": reg,
-                            "dr": dr,
-                            "traffic": traffic
-                        })
-                else:
-                    # No DR/Traffic data - include anyway with 0 values
-                    results.append({
-                        "source_url": url,
-                        "first_seen": r.get("first_seen_link"),
-                        "domain": reg,
-                        "dr": dr if dr is not None else 0,
-                        "traffic": traffic if traffic is not None else 0
-                    })
-
-            if show_debug:
-                if has_dr_data:
-                    st.success(f"✅ {target}: {len(results)} backlinks (DR/Traffic filter applied)")
-                else:
-                    st.warning(f"⚠️ {target}: {len(results)} backlinks (DR/Traffic data not available - no filter applied)")
-
-            return results
-
-        except requests.HTTPError as e:
-            if show_debug:
-                st.error(f"❌ {target}: {str(e)[:200]}")
-            return []
-
-    def fetch_new_backlinks_all(
-        self,
-        target: str,
-        days: int,
-        show_debug: bool = False
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch ALL new backlinks without DR/Traffic filter.
-        Used when we want to get all data and filter client-side.
-        """
-        start_iso, end_iso = iso_window_last_n_days(days)
-
-        if target == "gambling.com":
-            target = "www.gambling.com"
-
-        where_obj = {
-            "and": [
-                {"field": "first_seen_link", "is": ["gte", start_iso]},
-                {"field": "first_seen_link", "is": ["lte", end_iso]},
-                {"field": "last_seen", "is": "is_null"}
-            ]
-        }
-
-        try:
-            rows = self._paginate(self.EP_BACKLINKS, {
-                "target": f"{target}/",
-                "mode": "subdomains",
-                "limit": 50000,
-                "history": f"since:{start_iso[:10]}",
-                "order_by": "ahrefs_rank_source:asc",
-                "aggregation": "1_per_domain",
-                "protocol": "both",
-                "select": "url_from,first_seen_link,domain_rating_source,traffic_domain",
-                "where": json.dumps(where_obj),
-            })
-
-            if show_debug:
-                st.info(f"📊 {target}: Found {len(rows)} new backlinks (no filter)")
-                if rows:
-                    st.write(f"🔍 Sample row keys: {list(rows[0].keys())}")
+            if show_debug and rows:
+                st.info(f"📊 {target}: {len(rows)} new backlinks")
 
             results = []
             for r in rows:
@@ -413,33 +377,18 @@ class AhrefsClient:
                 reg = extract_registrable_domain(host)
                 if not reg:
                     continue
-
-                dr = r.get("domain_rating_source") or r.get("domain_rating") or 0
-                traffic = r.get("traffic_domain") or r.get("traffic") or 0
-
-                try:
-                    dr = int(dr) if dr else 0
-                    traffic = int(traffic) if traffic else 0
-                except (ValueError, TypeError):
-                    dr = 0
-                    traffic = 0
 
                 results.append({
                     "source_url": url,
                     "first_seen": r.get("first_seen_link"),
-                    "domain": reg,
-                    "dr": dr,
-                    "traffic": traffic
+                    "domain": reg
                 })
-
-            if show_debug:
-                st.info(f"📊 {target}: {len(results)} total new backlinks")
 
             return results
 
         except requests.HTTPError as e:
             if show_debug:
-                st.error(f"❌ {target}: {str(e)[:200]}")
+                st.error(f"❌ {target}: {str(e)[:150]}")
             return []
 
 # ---------------- SQLite Cache ----------------
@@ -490,7 +439,7 @@ def clear_cache_row(target_domain: str):
         conn.commit()
 
 # ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="Competitor Backlinks Analyzer v2.0", layout="wide")
+st.set_page_config(page_title="Competitor Backlinks Analyzer v3.0", layout="wide")
 S = st.secrets if hasattr(st, "secrets") else {}
 
 DEFAULT_BASE = S.get("AIRTABLE_BASE_ID", "appDEgCV6C4vLGjEY")
@@ -498,7 +447,6 @@ DEFAULT_TABLE = S.get("AIRTABLE_TABLE", "Sheet1")
 DEFAULT_VIEW = S.get("AIRTABLE_VIEW", "")
 DEFAULT_DOMAIN_FIELD = S.get("AIRTABLE_DOMAIN_FIELD", "Domain")
 
-# Predefined blocklist databases
 BLOCKLIST_DATABASES = [
     {"base_id": "appZEyAoVubSrBl9w", "table_id": "tbl4pzZFkzfKLhtkK", "view_id": "viw8Rad2HeDmOVMFq", "name": "BonusFinder-DataBase"},
     {"base_id": "appVyIiM5boVyoBhf", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Prospect-Data-1"},
@@ -520,7 +468,7 @@ BLOCKLIST_VIEW_ID = S.get("BLOCKLIST_VIEW_ID", "")
 BLOCKLIST_FIELD = S.get("BLOCKLIST_DOMAIN_FIELD", "Domain")
 DEFAULT_GAMBLING = S.get("GAMBLING_DOMAIN", "www.gambling.com")
 
-# Sidebar configuration
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -546,11 +494,13 @@ with st.sidebar:
     st.divider()
     st.subheader("⚡ Performance")
     max_concurrency = st.slider("Ahrefs concurrency", 2, 30, 12)
+    batch_size = st.slider("Batch Analysis size", 10, 100, 100,
+                           help="Domains per batch (max 100 per API docs)")
     show_debug = st.checkbox("Show debug info", value=False)
 
     st.divider()
     st.subheader("🚫 Exclusion Databases")
-    st.caption("Domains from selected databases will be excluded from results.")
+    st.caption("Domains from selected databases will be excluded.")
 
     selected_blocklist_dbs = []
     for db in BLOCKLIST_DATABASES:
@@ -563,85 +513,77 @@ with st.sidebar:
     with col1:
         run_btn = st.button("🚀 Run", type="primary", use_container_width=True)
     with col2:
-        refresh_cache_btn = st.button("🔄 Refresh Cache", use_container_width=True)
+        refresh_cache_btn = st.button("🔄 Refresh", use_container_width=True)
 
     clear_cache_btn = st.button("🗑️ Clear Cache", use_container_width=True)
     test_api_btn = st.button("🧪 Test API", use_container_width=True)
 
-# Get API tokens
+# API tokens
 AHREFS_TOKEN = os.getenv("AHREFS_API_TOKEN", S.get("AHREFS_API_TOKEN", ""))
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_KEY", S.get("AIRTABLE_API_KEY", ""))
 
-# Handle cache clear
 if clear_cache_btn:
     clear_cache_row(gambling_domain)
     st.success("✅ Cache cleared")
 
-# Token warnings
 if not AHREFS_TOKEN:
     st.warning("⚠️ Set AHREFS_API_TOKEN in Secrets or environment")
 if not AIRTABLE_TOKEN:
     st.warning("⚠️ Set AIRTABLE_API_KEY in Secrets or environment")
 
-# Create shared session
 shared_session = make_session(pool_size=100)
 
-# ---------------- API Test ----------------
+# ---------------- Test API ----------------
 if test_api_btn and AHREFS_TOKEN:
     st.write("## 🧪 API Test")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
-    with st.spinner("Testing API..."):
+    with st.spinner("Testing Batch Analysis API..."):
         try:
-            result = ah._get(ah.EP_REFDOMAINS, {
-                "target": f"{gambling_domain}/",
-                "mode": "subdomains",
-                "limit": 10,
-                "select": "domain,domain_rating,traffic"
-            })
+            # Test batch analysis with a few domains
+            test_domains = ["ahrefs.com", "moz.com", "semrush.com"]
+            results = ah.batch_get_domain_metrics(test_domains, batch_size=10, show_debug=True)
 
-            if "referring_domains" in result:
-                st.success(f"✅ API working! Sample: {len(result['referring_domains'])} domains")
-                if show_debug:
-                    st.json(result)
+            if results:
+                st.success(f"✅ Batch Analysis API working!")
+                for domain, metrics in results.items():
+                    st.write(f"  • {domain}: DR={metrics['dr']}, Traffic={metrics['traffic']:,}")
             else:
-                st.warning("⚠️ Unexpected response structure")
-                st.json(result)
+                st.warning("⚠️ No results returned")
         except Exception as e:
             st.error(f"❌ API test failed: {e}")
 
 # ---------------- Main Pipeline ----------------
 def run_pipeline(force_refresh_cache: bool = False):
     """
-    OPTIMIZED PIPELINE v2.0
+    OPTIMIZED PIPELINE v3.0 using Batch Analysis API
 
-    Improvements:
-    1. Parallel Airtable fetches (competitors + blocklists simultaneously)
-    2. Single API call for qualified domains with metrics
-    3. Early filtering against blocklist
-    4. In-memory metrics caching
-    5. Higher concurrency with optimized connection pooling
+    Strategy:
+    1. Load competitors and blocklists in parallel
+    2. Load baseline domains (cached)
+    3. Fetch new backlinks for each competitor (parallel)
+    4. Collect unique domains not in baseline/blocklist
+    5. Use BATCH ANALYSIS API to get DR/Traffic for all domains at once
+    6. Apply DR/Traffic filter
     """
 
     start_time = datetime.now()
-    st.write("# 🚀 Competitor Backlinks Analysis v2.0")
-    st.info(f"**Optimizations:** Single API call for DR/Traffic, parallel fetches, in-memory caching")
+    st.write("# 🚀 Competitor Backlinks Analysis v3.0")
+    st.info("**Using Batch Analysis API** for efficient DR/Traffic lookup")
 
-    # Initialize clients
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
     at_primary = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
 
     # ============================================
-    # PHASE 1: Parallel data loading (Airtable)
+    # PHASE 1: Load competitors and blocklists (parallel)
     # ============================================
-    st.write("## 📥 Phase 1: Loading Data (Parallel)")
+    st.write("## 📥 Phase 1: Loading Data")
 
     competitors: List[str] = []
     blocklist_domains: Set[str] = set()
     load_errors: List[str] = []
 
     def load_competitors() -> List[str]:
-        """Load competitor domains from primary Airtable."""
         try:
             raw = at_primary.fetch_domains(
                 airtable_table,
@@ -654,7 +596,6 @@ def run_pipeline(force_refresh_cache: bool = False):
             return []
 
     def load_blocklist_db(db_config: Dict[str, str]) -> Set[str]:
-        """Load domains from a blocklist database."""
         base_id = db_config.get("base_id", "").strip()
         table_id = db_config.get("table_id", BLOCKLIST_TABLE)
         view_id = db_config.get("view_id") or BLOCKLIST_VIEW_ID or None
@@ -670,7 +611,6 @@ def run_pipeline(force_refresh_cache: bool = False):
             load_errors.append(f"{db_name}: {e}")
             return set()
 
-    # Prepare all blocklist configs
     all_blocklist_configs = selected_blocklist_dbs.copy()
     for base_id in LEGACY_BLOCKLIST_IDS:
         if base_id.strip() and not any(db["base_id"] == base_id.strip() for db in all_blocklist_configs):
@@ -681,23 +621,16 @@ def run_pipeline(force_refresh_cache: bool = False):
                 "name": f"Legacy ({base_id.strip()})"
             })
 
-    # PARALLEL: Load competitors and blocklists simultaneously
-    with st.spinner("Loading competitors and blocklists in parallel..."):
+    with st.spinner("Loading competitors and blocklists..."):
         with ThreadPoolExecutor(max_workers=min(16, 1 + len(all_blocklist_configs))) as pool:
-            # Submit competitor fetch
             comp_future = pool.submit(load_competitors)
-
-            # Submit all blocklist fetches
             blocklist_futures = [pool.submit(load_blocklist_db, db) for db in all_blocklist_configs]
 
-            # Collect results
             competitors = comp_future.result()
-
             for fut in as_completed(blocklist_futures):
                 blocklist_domains.update(fut.result() or set())
 
-    st.write(f"✅ **{len(competitors)}** competitors loaded")
-    st.write(f"✅ **{len(blocklist_domains):,}** domains in exclusion list")
+    st.write(f"✅ **{len(competitors)}** competitors | **{len(blocklist_domains):,}** excluded domains")
 
     if load_errors:
         with st.expander("⚠️ Load warnings"):
@@ -705,7 +638,7 @@ def run_pipeline(force_refresh_cache: bool = False):
                 st.write(f"- {err}")
 
     # ============================================
-    # PHASE 2: Baseline (Gambling.com domains)
+    # PHASE 2: Baseline domains
     # ============================================
     st.write("## 📊 Phase 2: Baseline Domains")
 
@@ -730,41 +663,18 @@ def run_pipeline(force_refresh_cache: bool = False):
     st.write(f"**Baseline:** {len(gdc_ref_set):,} domains for {gambling_domain}")
 
     # ============================================
-    # PHASE 3: Fetch competitor backlinks (Parallel)
+    # PHASE 3: Fetch backlinks from competitors
     # ============================================
     st.write("## 🔍 Phase 3: Competitor Backlinks")
-    if enable_quality_filter:
-        st.info(f"**Filters:** DR ≥ {min_dr}, Traffic ≥ {min_traffic:,} | **Window:** Last {days} days")
-    else:
-        st.info(f"**Filters:** None (fetching ALL backlinks) | **Window:** Last {days} days")
+    st.info(f"**Window:** Last {days} days | Fetching new backlinks from {len(competitors)} competitors")
 
-    output_records: List[Dict[str, Any]] = []
+    all_backlinks: List[Dict[str, Any]] = []
     api_errors: List[str] = []
-    processed_domains: Set[str] = set()  # Track unique domains
+    competitor_counts: Dict[str, int] = {}
 
-    def fetch_competitor_backlinks(comp: str) -> List[Dict[str, Any]]:
-        """Fetch backlinks for a single competitor."""
+    def fetch_competitor(comp: str) -> List[Dict[str, Any]]:
         try:
-            if enable_quality_filter:
-                return ah.fetch_new_backlinks_with_metrics(
-                    comp,
-                    days=days,
-                    min_dr=min_dr,
-                    min_traffic=min_traffic,
-                    show_debug=show_debug
-                )
-            else:
-                return ah.fetch_new_backlinks_all(
-                    comp,
-                    days=days,
-                    show_debug=show_debug
-                )
-        except requests.HTTPError as e:
-            if "API units limit reached" in str(e):
-                api_errors.append(f"{comp}: API limit reached")
-            else:
-                api_errors.append(f"{comp}: {str(e)[:100]}")
-            return []
+            return ah.fetch_new_backlinks_raw(comp, days=days, show_debug=show_debug)
         except Exception as e:
             api_errors.append(f"{comp}: {str(e)[:100]}")
             return []
@@ -775,7 +685,7 @@ def run_pipeline(force_refresh_cache: bool = False):
         completed = 0
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
-            futures = {pool.submit(fetch_competitor_backlinks, c): c for c in competitors}
+            futures = {pool.submit(fetch_competitor, c): c for c in competitors}
 
             for future in as_completed(futures):
                 comp = futures[future]
@@ -783,61 +693,122 @@ def run_pipeline(force_refresh_cache: bool = False):
 
                 try:
                     results = future.result() or []
+                    competitor_counts[comp] = len(results)
 
                     for r in results:
-                        domain = r.get("domain", "")
+                        r["competitor"] = comp
+                        all_backlinks.append(r)
 
-                        # Skip if already in baseline, blocklist, or already processed
-                        if domain and domain not in gdc_ref_set and domain not in blocklist_domains:
-                            if domain not in processed_domains:
-                                processed_domains.add(domain)
-                                output_records.append({
-                                    "linking_domain": domain,
-                                    "source_url": r.get("source_url", ""),
-                                    "first_seen": r.get("first_seen", ""),
-                                    "dr": r.get("dr", 0),
-                                    "traffic": r.get("traffic", 0),
-                                    "competitor": comp
-                                })
                 except Exception as e:
                     api_errors.append(f"{comp}: {str(e)[:100]}")
 
-                # Update progress
                 progress_bar.progress(completed / len(competitors))
-                status_text.text(f"Processing: {completed}/{len(competitors)} competitors | Found: {len(output_records)} domains")
+                status_text.text(f"Fetching: {completed}/{len(competitors)} | Total backlinks: {len(all_backlinks):,}")
 
         status_text.empty()
 
+    st.write(f"📊 Fetched **{len(all_backlinks):,}** total backlinks from {len(competitors)} competitors")
+
     if api_errors:
         with st.expander(f"⚠️ {len(api_errors)} API errors"):
-            for err in api_errors[:20]:  # Show first 20
+            for err in api_errors[:20]:
                 st.write(f"- {err}")
-            if len(api_errors) > 20:
-                st.write(f"... and {len(api_errors) - 20} more")
 
     # ============================================
-    # PHASE 4: Results
+    # PHASE 4: Filter and collect unique domains
+    # ============================================
+    st.write("## 🎯 Phase 4: Filtering & Metrics")
+
+    # Collect unique domains not in baseline/blocklist
+    unique_domains: Dict[str, Dict[str, Any]] = {}  # domain -> first backlink info
+    counters = {"baseline": 0, "blocklist": 0, "duplicate": 0}
+
+    for bl in all_backlinks:
+        domain = bl.get("domain", "")
+        if not domain:
+            continue
+
+        if domain in gdc_ref_set:
+            counters["baseline"] += 1
+            continue
+
+        if domain in blocklist_domains:
+            counters["blocklist"] += 1
+            continue
+
+        if domain in unique_domains:
+            counters["duplicate"] += 1
+            continue
+
+        # New unique domain
+        unique_domains[domain] = {
+            "source_url": bl.get("source_url", ""),
+            "first_seen": bl.get("first_seen", ""),
+            "competitor": bl.get("competitor", "")
+        }
+
+    st.write(f"📊 **{len(unique_domains):,}** unique domains after filtering")
+    st.write(f"   • Filtered (in baseline): {counters['baseline']:,}")
+    st.write(f"   • Filtered (in blocklist): {counters['blocklist']:,}")
+    st.write(f"   • Duplicates removed: {counters['duplicate']:,}")
+
+    if not unique_domains:
+        st.success("No exclusive domains found after filtering.")
+        elapsed = (datetime.now() - start_time).total_seconds()
+        st.write(f"⏱️ Completed in {elapsed:.1f}s")
+        return
+
+    # ============================================
+    # PHASE 5: Get DR/Traffic via Batch Analysis API
+    # ============================================
+    st.write("## 📈 Phase 5: Batch Analysis (DR/Traffic)")
+    st.info(f"Getting metrics for {len(unique_domains):,} domains using Batch Analysis API...")
+
+    domain_list = list(unique_domains.keys())
+    metrics = ah.batch_get_domain_metrics(domain_list, batch_size=batch_size, show_debug=show_debug)
+
+    # ============================================
+    # PHASE 6: Apply DR/Traffic filter and build output
     # ============================================
     st.write("## 📋 Results")
+
+    output_records: List[Dict[str, Any]] = []
+
+    for domain, info in unique_domains.items():
+        domain_metrics = metrics.get(domain, {"dr": 0, "traffic": 0})
+        dr = domain_metrics.get("dr", 0)
+        traffic = domain_metrics.get("traffic", 0)
+
+        # Apply filter if enabled
+        if enable_quality_filter:
+            if dr < min_dr or traffic < min_traffic:
+                continue
+
+        output_records.append({
+            "linking_domain": domain,
+            "dr": dr,
+            "traffic": traffic,
+            "source_url": info.get("source_url", ""),
+            "first_seen": info.get("first_seen", ""),
+            "competitor": info.get("competitor", "")
+        })
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
     if not output_records:
-        st.success("No exclusive domains found after applying all filters.")
+        if enable_quality_filter:
+            st.warning(f"No domains found with DR ≥ {min_dr} and Traffic ≥ {min_traffic:,}")
+            st.info("💡 Try disabling the DR/Traffic filter to see all results")
+        else:
+            st.success("No exclusive domains found after filtering.")
         st.write(f"⏱️ Completed in {elapsed:.1f}s")
         return
 
-    # Create DataFrame with all columns including DR and Traffic
+    # Create DataFrame
     df = pd.DataFrame.from_records(output_records)
-
-    # Sort by DR descending, then Traffic descending
     df = df.sort_values(by=["dr", "traffic"], ascending=[False, False])
 
-    # Reorder columns for better display
-    column_order = ["linking_domain", "dr", "traffic", "source_url", "first_seen", "competitor"]
-    df = df[[c for c in column_order if c in df.columns]]
-
-    # Display metrics
+    # Metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Unique Domains", f"{len(df):,}")
@@ -848,7 +819,7 @@ def run_pipeline(force_refresh_cache: bool = False):
     with col4:
         st.metric("Time", f"{elapsed:.1f}s")
 
-    # Display table
+    # Table
     st.dataframe(
         df,
         use_container_width=True,
@@ -862,7 +833,7 @@ def run_pipeline(force_refresh_cache: bool = False):
         }
     )
 
-    # Download button
+    # Download
     csv_data = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "📥 Download CSV",
@@ -875,7 +846,7 @@ def run_pipeline(force_refresh_cache: bool = False):
 # ---------------- Action Handlers ----------------
 if run_btn:
     if not (airtable_base_id and airtable_table and AHREFS_TOKEN and AIRTABLE_TOKEN):
-        st.error("Please configure all required settings (Airtable Base ID, Table, and API tokens)")
+        st.error("Please configure all required settings")
     else:
         run_pipeline(force_refresh_cache=False)
 
@@ -888,11 +859,10 @@ if refresh_cache_btn:
 # Footer
 st.divider()
 st.caption("""
-**v2.1.0** — Fixed & Optimized
-- Fixed: Now fetches backlinks first, then filters by DR/Traffic
-- DR/Traffic filter can be disabled to get ALL backlinks
-- DR and Traffic included in output
-- Parallel Airtable fetches
+**v3.0.1** — Batch Analysis API (max 100 targets per batch)
+- Uses `/batch-analysis` endpoint for DR/Traffic (much more efficient)
+- Fetches backlinks first, then batch-queries metrics
+- Parallel Airtable & backlink fetches
+- DR/Traffic filter can be disabled
 - LRU caching for domain extraction
-- Optimized connection pooling
 """)
