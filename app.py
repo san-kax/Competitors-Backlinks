@@ -527,8 +527,8 @@ with st.sidebar:
     show_debug = st.checkbox("Show debug counts", value=False)
     
     st.divider()
-    st.subheader("Blocklist Databases (Deduplication)")
-    st.caption("Select Airtable databases to exclude from results")
+    st.subheader("Exclude Domains From Databases")
+    st.caption("Check databases below. Any domains found in these databases will be excluded from the final results.")
     
     # Create checkboxes for each database
     selected_blocklist_dbs = []
@@ -593,8 +593,8 @@ def run_pipeline(force_refresh_cache: bool = False):
     competitors = sorted({sanitize_target_for_ahrefs(x) for x in competitors_raw if sanitize_target_for_ahrefs(x)})
     st.write(f"Found **{len(competitors)}** competitor domains.")
 
-    # 2) Blocklists
-    st.write("## 2) Loading blocklist Airtable bases…")
+    # 2) Exclusion Databases
+    st.write("## 2) Loading exclusion databases…")
     blocklist_domains: Set[str] = set()
     load_errors = []
     
@@ -651,15 +651,15 @@ def run_pipeline(force_refresh_cache: bool = False):
             for fut in as_completed(futures):
                 blocklist_domains.update(fut.result() or set())
         
-        st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len(all_blocklist_configs)}** database(s).")
+        st.write(f"Loaded **{len(blocklist_domains)}** domains to exclude from **{len(all_blocklist_configs)}** database(s).")
         if selected_blocklist_dbs:
             selected_names = [db['name'] for db in selected_blocklist_dbs]
-            st.info(f"📋 Selected databases: {', '.join(selected_names)}")
+            st.info(f"📋 Excluding domains from: {', '.join(selected_names)}")
     else:
-        st.info("ℹ️ No blocklist databases selected. All domains will be included in results.")
+        st.info("ℹ️ No exclusion databases selected. All domains will be included in results.")
     
     if load_errors:
-        with st.expander("⚠️ Blocklist load warnings/errors"):
+        with st.expander("⚠️ Database load warnings/errors"):
             for err in load_errors:
                 st.write(f"- {err}")
 
@@ -778,7 +778,7 @@ def run_pipeline(force_refresh_cache: bool = False):
     # 5) Results
     st.write("## 5) Final results — exclusive domains")
     if not output_records:
-        st.success("No exclusive domains found after filtering Gambling.com baseline and blocklists.")
+        st.success("No exclusive domains found after filtering out Gambling.com baseline and excluded databases.")
         return
     df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["linking_domain"])
     st.dataframe(df, use_container_width=True)
