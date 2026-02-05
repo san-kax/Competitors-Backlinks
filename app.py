@@ -500,9 +500,12 @@ class AhrefsClient:
             st.info(f"🔍 {target}: Fetching backlinks from {start_iso[:10]} to {end_iso[:10]} (last {days} days)")
             st.write(f"   Date range: {start_iso} to {end_iso}")
         
+        # Try multiple approaches - some APIs don't support date filters in where clause
+        rows = []
+        error_msg = None
+        
+        # Approach 1: Try with date filters in where clause
         try:
-            # Try with both history parameter AND where clause date filters
-            # Some APIs need both, some prefer one or the other
             where_obj_with_date = {"and":[
                 {"field":"last_seen","is":"is_null"},  # Live links only
                 {"field":"first_seen_link","is":["gte",start_iso]},  # Date filter in where clause
@@ -520,13 +523,64 @@ class AhrefsClient:
                 "select": "url_from,first_seen_link,domain_rating_source,traffic_source",  # Try source domain metrics
                 "where": json.dumps(where_obj_with_date),  # Use where clause with date filters
             })
-            
             if show_debug:
-                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
-                if rows:
-                    # Show sample dates to debug
-                    sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
-                    st.write(f"   Sample first_seen dates: {sample_dates}")
+                st.success(f"✅ {target}: Approach 1 (with date filters in where) succeeded - got {len(rows)} rows")
+        except Exception as e1:
+            error_msg = str(e1)
+            if show_debug:
+                st.warning(f"⚠️ {target}: Approach 1 failed: {str(e1)[:200]}")
+            
+            # Approach 2: Try without date filters in where clause (only history parameter)
+            try:
+                if show_debug:
+                    st.info(f"🔄 {target}: Trying Approach 2 (history only, no date filters in where)")
+                rows = self._paginate(self.EP_BACKLINKS, {
+                    "target": f"{target}/",
+                    "mode": "subdomains",
+                    "limit": 50000,
+                    "history": f"since:{start_iso[:10]}",  # Use history parameter for date filtering
+                    "order_by": "ahrefs_rank_source:asc",
+                    "aggregation": "1_per_domain",
+                    "protocol":"both",
+                    "select": "url_from,first_seen_link,domain_rating_source,traffic_source",
+                    "where": json.dumps(where_obj),  # Only last_seen filter, no date filters
+                })
+                if show_debug:
+                    st.success(f"✅ {target}: Approach 2 (history only) succeeded - got {len(rows)} rows")
+            except Exception as e2:
+                error_msg = str(e2)
+                if show_debug:
+                    st.error(f"❌ {target}: Approach 2 also failed: {str(e2)[:200]}")
+                
+                # Approach 3: Try with no where clause at all (just history)
+                try:
+                    if show_debug:
+                        st.info(f"🔄 {target}: Trying Approach 3 (history only, no where clause)")
+                    rows = self._paginate(self.EP_BACKLINKS, {
+                        "target": f"{target}/",
+                        "mode": "subdomains",
+                        "limit": 50000,
+                        "history": f"since:{start_iso[:10]}",
+                        "order_by": "ahrefs_rank_source:asc",
+                        "aggregation": "1_per_domain",
+                        "protocol":"both",
+                        "select": "url_from,first_seen_link,domain_rating_source,traffic_source",
+                        # No where clause at all
+                    })
+                    if show_debug:
+                        st.success(f"✅ {target}: Approach 3 (no where clause) succeeded - got {len(rows)} rows")
+                except Exception as e3:
+                    error_msg = str(e3)
+                    if show_debug:
+                        st.error(f"❌ {target}: All approaches failed. Last error: {str(e3)[:200]}")
+        
+        # Process the rows we got (if any)
+        if show_debug:
+            st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
+            if rows:
+                # Show sample dates to debug
+                sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
+                st.write(f"   Sample first_seen dates: {sample_dates}")
             
             # Filter by date client-side to ensure we only get backlinks in our date range
             # The history parameter might return more than we need
@@ -671,7 +725,7 @@ with st.sidebar:
     days = st.number_input("Window (days)", min_value=1, max_value=60, value=14)
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
     max_concurrency = st.slider("Ahrefs concurrency", 2, 20, 8)
-    show_debug = st.checkbox("Show debug counts", value=False)
+    show_debug = st.checkbox("Show debug output", value=True)  # Default to True to help debug "0 new" issue
     
     st.divider()
     st.subheader("Exclude Domains From Databases")
