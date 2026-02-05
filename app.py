@@ -880,22 +880,19 @@ def run_pipeline(force_refresh_cache: bool = False):
     if api_limit_hit:
         st.warning("⚠️ Ahrefs API limit reached for some competitors. Results may be incomplete. Consider reducing concurrency or checking your API subscription.")
 
-    # 5) Enrich results with DR and Traffic data (only if not already fetched from backlinks)
+    # 5) Enrich results with DR and Traffic data
     if output_records:
-        # Check if we already have DR/Traffic data from backlinks
-        has_metrics = any(r.get("dr") is not None or r.get("traffic") is not None for r in output_records)
+        # Always fetch DR/Traffic since /all-backlinks endpoint doesn't provide it
+        unique_domains = sorted(set(r["linking_domain"] for r in output_records))
         
-        if not has_metrics:
-            unique_domains = sorted(set(r["linking_domain"] for r in output_records))
-            
-            # Ask user if they want to fetch DR/Traffic (can be slow for many domains)
-            if len(unique_domains) > 100:
-                st.write("## 5) Fetching DR and Traffic data for linking domains...")
-                st.warning(f"⚠️ Fetching DR/Traffic for {len(unique_domains)} domains may take several minutes and use significant API credits.")
-                fetch_metrics = st.checkbox("Fetch DR and Traffic data", value=False, key="fetch_metrics")
-            else:
-                fetch_metrics = True
-                st.write("## 5) Fetching DR and Traffic data for linking domains...")
+        # Fetch DR/Traffic data (required for quality analysis)
+        st.write("## 5) Fetching DR and Traffic data for linking domains...")
+        if len(unique_domains) > 100:
+            st.warning(f"⚠️ Fetching DR/Traffic for {len(unique_domains)} domains may take several minutes and use significant API credits.")
+            st.info("💡 Tip: This step can be skipped if you only need domain lists, but DR/Traffic helps identify high-quality opportunities.")
+            fetch_metrics = st.checkbox("Fetch DR and Traffic data", value=True, key="fetch_metrics")
+        else:
+            fetch_metrics = True  # Auto-fetch for smaller sets
             
             domain_metrics = {}
             if fetch_metrics:
@@ -964,8 +961,6 @@ def run_pipeline(force_refresh_cache: bool = False):
                     record["dr"] = None
                     record["traffic"] = None
                 st.info("ℹ️ Skipped DR/Traffic fetching. Results will show without these metrics.")
-        else:
-            st.info("✅ DR and Traffic data already included from backlinks data")
 
     # 6) Results
     st.write("## 6) Final results — exclusive domains")
