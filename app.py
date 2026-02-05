@@ -575,12 +575,13 @@ class AhrefsClient:
                         st.error(f"❌ {target}: All approaches failed. Last error: {str(e3)[:200]}")
         
         # Process the rows we got (if any)
-        if show_debug:
-            st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
-            if rows:
-                # Show sample dates to debug
-                sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
-                st.write(f"   Sample first_seen dates: {sample_dates}")
+        try:
+            if show_debug:
+                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
+                if rows:
+                    # Show sample dates to debug
+                    sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
+                    st.write(f"   Sample first_seen dates: {sample_dates}")
             
             # Filter by date client-side to ensure we only get backlinks in our date range
             # The history parameter might return more than we need
@@ -645,7 +646,7 @@ class AhrefsClient:
             return out
         except Exception as e:
             if show_debug:
-                st.error(f"❌ {target}: Error fetching backlinks - {str(e)[:200]}")
+                st.error(f"❌ {target}: Error processing backlinks - {str(e)[:200]}")
             return []
 
 # ---------------- cache ----------------
