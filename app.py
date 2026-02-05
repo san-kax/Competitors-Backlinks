@@ -882,12 +882,76 @@ def run_pipeline(force_refresh_cache: bool = False):
     if api_limit_hit:
         st.warning("⚠️ Ahrefs API limit reached for some competitors. Results may be incomplete. Consider reducing concurrency or checking your API subscription.")
 
-    # 5) Results
-    st.write("## 5) Final results — exclusive domains")
+    # 5) Enrich results with DR and Traffic data
+    if output_records:
+        st.write("## 5) Fetching DR and Traffic data for linking domains...")
+        unique_domains = sorted(set(r["linking_domain"] for r in output_records))
+        st.info(f"📊 Fetching DR/Traffic for {len(unique_domains)} unique domains...")
+        
+        # Create a method to fetch DR/Traffic for a domain
+        def fetch_domain_metrics(domain: str) -> Tuple[Optional[int], Optional[int]]:
+            """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
+            try:
+                # Query the domain itself to get its metrics
+                params = {
+                    "target": f"{domain}/",
+                    "mode": "domain",
+                    "limit": 1,
+                    "select": "domain,domain_rating,traffic",
+                }
+                result = ah._get(ah.EP_REFDOMAINS, params)
+                # Response might have different structures
+                rows = (result.get("referring_domains") or 
+                       result.get("data", {}).get("rows", []) or 
+                       result.get("rows", []) or
+                       [result] if isinstance(result, dict) and "domain" in result else [])
+                
+                for r in rows:
+                    # Check if this row matches our domain
+                    row_domain = r.get("domain") or r.get("referring_domain")
+                    if row_domain:
+                        reg = extract_registrable_domain(row_domain)
+                        if reg == domain:
+                            dr = r.get("domain_rating") or r.get("dr") or 0
+                            traffic = r.get("traffic") or r.get("organic_traffic") or 0
+                            return (int(dr) if isinstance(dr, (int, float)) and dr > 0 else None, 
+                                   int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None)
+            except Exception as e:
+                if show_debug:
+                    st.write(f"⚠️ Could not fetch metrics for {domain}: {str(e)[:100]}")
+            return None, None
+        
+        # Fetch DR/Traffic for all unique domains (with progress)
+        domain_metrics = {}
+        prog_metrics = st.progress(0.0)
+        with ThreadPoolExecutor(max_workers=min(10, len(unique_domains))) as pool:
+            futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
+            done = 0
+            for fut in as_completed(futures):
+                domain = futures[fut]
+                dr, traffic = fut.result()
+                domain_metrics[domain] = {"dr": dr, "traffic": traffic}
+                done += 1
+                prog_metrics.progress(done / len(unique_domains))
+        
+        # Add DR and Traffic to output records
+        for record in output_records:
+            domain = record["linking_domain"]
+            metrics = domain_metrics.get(domain, {})
+            record["dr"] = metrics.get("dr")
+            record["traffic"] = metrics.get("traffic")
+        
+        st.success(f"✅ Fetched DR/Traffic data for {len(domain_metrics)} domains")
+
+    # 6) Results
+    st.write("## 6) Final results — exclusive domains")
     if not output_records:
         st.success("No exclusive domains found after filtering out Gambling.com baseline and excluded databases.")
         return
     df = pd.DataFrame.from_records(output_records).drop_duplicates(subset=["linking_domain"])
+    # Reorder columns: linking_domain, dr, traffic, source_url, first_seen
+    column_order = ["linking_domain", "dr", "traffic", "source_url", "first_seen"]
+    df = df[[col for col in column_order if col in df.columns]]
     st.dataframe(df, use_container_width=True)
     st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "exclusive_domains.csv")
 
