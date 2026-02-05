@@ -1,4 +1,4 @@
-# v1.5.9 — Fixed pagination to fetch ALL domains (~32,200) instead of just 100
+# v1.6.0 — Added multi-select for blocklist databases + Fixed NameError bug in test_exact_api_call
 
 import os, json, sqlite3
 from datetime import datetime, timedelta, timezone
@@ -183,7 +183,7 @@ class AhrefsClient:
                 
         return out
 
-    def test_exact_api_call(self, target: str) -> Dict[str, Any]:
+    def test_exact_api_call(self, target: str, show_debug: bool = False) -> Dict[str, Any]:
         """Test the exact API call matching the Ahrefs interface - OPTIMIZED (limit 100 for testing only)"""
         
         # Ensure we use www.gambling.com format if it's gambling.com
@@ -491,7 +491,24 @@ DEFAULT_TABLE = S.get("AIRTABLE_TABLE", "Sheet1")
 DEFAULT_VIEW  = S.get("AIRTABLE_VIEW", "")
 DEFAULT_DOMAIN_FIELD = S.get("AIRTABLE_DOMAIN_FIELD", "Domain")
 
-BLOCKLIST_IDS     = S.get("BLOCKLIST_BASE_IDS", "").split(",") if S.get("BLOCKLIST_BASE_IDS") else []
+# Predefined blocklist databases with their table and view IDs
+BLOCKLIST_DATABASES = [
+    {"base_id": "appZEyAoVubSrBl9w", "table_id": "tbl4pzZFkzfKLhtkK", "view_id": "viw8Rad2HeDmOVMFq", "name": "Database 1"},
+    {"base_id": "appVyIiM5boVyoBhf", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 2"},
+    {"base_id": "appHdhjsWVRxaCvcR", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 3"},
+    {"base_id": "appay75NrffUxBMbM", "table_id": "tblx8ZGIuvQ9cWdXh", "view_id": "viwjZQhBfwfO93rwH", "name": "Database 4"},
+    {"base_id": "app08yUTcPhJVPxCI", "table_id": "tbllmyX2xNVXMEEnc", "view_id": "viwZsNbPETozNaPeq", "name": "Database 5"},
+    {"base_id": "appDFsy6RWw5TRNH6", "table_id": "tbl8whN06WyCOo5uk", "view_id": "viwmDXgf68l5mSLhQ", "name": "Database 6"},
+    {"base_id": "appEEpV8mgLcBMQLE", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 7"},
+    {"base_id": "appJTJQwjHRaAyLkw", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 8"},
+    {"base_id": "appUoOvkqzJvyyMvC", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 9"},
+    {"base_id": "appueIgn44RaVH6ot", "table_id": "tbl3vMYv4RzKfuBf4", "view_id": "viwVtggxfTbwRH9fd", "name": "Database 10"},
+    {"base_id": "appFBasaCUkEKtvpV", "table_id": "tblmTREzfIswOuA0F", "view_id": "viwY2JkQ2xtXp6FoD", "name": "Database 11"},
+    {"base_id": "appTf6MmZDgouu8SN", "table_id": "tbliCOQZY9RICLsLP", "view_id": "viwwatwEcYK8v7KQ4", "name": "Database 12"},
+]
+
+# Legacy support: parse old BLOCKLIST_BASE_IDS format
+LEGACY_BLOCKLIST_IDS = S.get("BLOCKLIST_BASE_IDS", "").split(",") if S.get("BLOCKLIST_BASE_IDS") else []
 BLOCKLIST_TABLE   = S.get("BLOCKLIST_TABLE_NAME", "tbliCOQZY9RICLsLP")
 BLOCKLIST_VIEW_ID = S.get("BLOCKLIST_VIEW_ID", "")
 BLOCKLIST_FIELD   = S.get("BLOCKLIST_DOMAIN_FIELD", "Domain")
@@ -508,6 +525,22 @@ with st.sidebar:
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
     max_concurrency = st.slider("Ahrefs concurrency", 2, 20, 8)
     show_debug = st.checkbox("Show debug counts", value=False)
+    
+    st.divider()
+    st.subheader("Blocklist Databases (Deduplication)")
+    st.caption("Select Airtable databases to exclude from results")
+    
+    # Create options list for multi-select
+    blocklist_options = {f"{db['name']} ({db['base_id']})": db for db in BLOCKLIST_DATABASES}
+    selected_blocklist_names = st.multiselect(
+        "Select blocklist databases",
+        options=list(blocklist_options.keys()),
+        default=[],  # Default to none selected
+        help="Select one or more databases to use as blocklists for deduplication"
+    )
+    
+    # Get selected database configs
+    selected_blocklist_dbs = [blocklist_options[name] for name in selected_blocklist_names]
 
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache_btn = st.button("Refresh Gambling.com cache")
@@ -535,7 +568,7 @@ if test_api_btn:
         ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
         
         # Test with the configured domain
-        test_result = ah.test_exact_api_call(gambling_domain)
+        test_result = ah.test_exact_api_call(gambling_domain, show_debug=show_debug)
         if test_result["success"]:
             st.success(f"✅ API test successful! Found {test_result['rows_count']} backlinks for {gambling_domain}")
             st.info("ℹ️ Using optimized minimal fields (url_from only) to reduce API unit consumption by ~90%")
@@ -564,21 +597,70 @@ def run_pipeline(force_refresh_cache: bool = False):
     st.write("## 2) Loading blocklist Airtable bases…")
     blocklist_domains: Set[str] = set()
     load_errors = []
-    def load_blocklist(base_id: str) -> Set[str]:
-        if not base_id.strip(): return set()
+    
+    def load_blocklist_db(db_config: Dict[str, str]) -> Set[str]:
+        """Load domains from a specific blocklist database configuration"""
+        base_id = db_config.get("base_id", "").strip()
+        table_id = db_config.get("table_id", BLOCKLIST_TABLE)
+        view_id = db_config.get("view_id") or BLOCKLIST_VIEW_ID or None
+        db_name = db_config.get("name", base_id)
+        
+        if not base_id:
+            return set()
+        
+        cli = AirtableClient(AIRTABLE_TOKEN, base_id, session=shared_session)
+        try:
+            domains = cli.fetch_domains(table_id, BLOCKLIST_FIELD, view_or_id=view_id)
+            return set(domains)
+        except requests.HTTPError as e:
+            load_errors.append(f"{db_name} ({base_id}): {str(e)}")
+            return set()
+        except Exception as e:
+            load_errors.append(f"{db_name} ({base_id}): Unexpected error - {str(e)}")
+            return set()
+    
+    def load_blocklist_legacy(base_id: str) -> Set[str]:
+        """Legacy function for old BLOCKLIST_IDS format"""
+        if not base_id.strip():
+            return set()
         cli = AirtableClient(AIRTABLE_TOKEN, base_id.strip(), session=shared_session)
         try:
             return set(cli.fetch_domains(BLOCKLIST_TABLE, BLOCKLIST_FIELD, view_or_id=(BLOCKLIST_VIEW_ID or None)))
         except requests.HTTPError as e:
-            load_errors.append(str(e)); return set()
-    if BLOCKLIST_IDS:
-        with ThreadPoolExecutor(max_workers=min(8, len(BLOCKLIST_IDS))) as pool:
-            for fut in as_completed([pool.submit(load_blocklist, b) for b in BLOCKLIST_IDS]):
+            load_errors.append(f"Legacy {base_id}: {str(e)}")
+            return set()
+    
+    # Load from selected databases
+    all_blocklist_configs = selected_blocklist_dbs.copy()
+    
+    # Also support legacy BLOCKLIST_IDS if provided (for backward compatibility)
+    if LEGACY_BLOCKLIST_IDS:
+        for base_id in LEGACY_BLOCKLIST_IDS:
+            if base_id.strip() and not any(db["base_id"] == base_id.strip() for db in all_blocklist_configs):
+                # Add as legacy config
+                all_blocklist_configs.append({
+                    "base_id": base_id.strip(),
+                    "table_id": BLOCKLIST_TABLE,
+                    "view_id": BLOCKLIST_VIEW_ID or "",
+                    "name": f"Legacy ({base_id.strip()})"
+                })
+    
+    if all_blocklist_configs:
+        with ThreadPoolExecutor(max_workers=min(8, len(all_blocklist_configs))) as pool:
+            futures = [pool.submit(load_blocklist_db, db) for db in all_blocklist_configs]
+            for fut in as_completed(futures):
                 blocklist_domains.update(fut.result() or set())
-    st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len([b for b in BLOCKLIST_IDS if b.strip()])}** base(s).")
+        
+        st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len(all_blocklist_configs)}** database(s).")
+        if selected_blocklist_names:
+            st.info(f"📋 Selected databases: {', '.join(selected_blocklist_names)}")
+    else:
+        st.info("ℹ️ No blocklist databases selected. All domains will be included in results.")
+    
     if load_errors:
-        with st.expander("Blocklist load warnings"):
-            for err in load_errors: st.write(f"- {err}")
+        with st.expander("⚠️ Blocklist load warnings/errors"):
+            for err in load_errors:
+                st.write(f"- {err}")
 
     # 3) Gambling.com baseline - OPTIMIZED: Try /refdomains first (cheaper), then minimal /all-backlinks
     st.write("## 3) Gambling.com referring domains (baseline) - OPTIMIZED")
@@ -719,4 +801,4 @@ if refresh_cache_btn:
     if not AHREFS_TOKEN: st.error("AHREFS_API_TOKEN missing.")
     else: run_pipeline(force_refresh_cache=True)
 
-st.caption("v1.5.9 - FIXED: Improved pagination to fetch ALL domains (~32,200) instead of just 100. Test method uses limit 100 for testing only. Pipeline methods use limit 50000 with proper pagination to fetch all results. Optimized API unit consumption by ~90% using minimal select fields.")
+st.caption("v1.6.0 - Added multi-select for blocklist databases with per-database table/view IDs. Fixed NameError bug in test_exact_api_call. Improved pagination to fetch ALL domains (~32,200). Optimized API unit consumption by ~90% using minimal select fields.")
