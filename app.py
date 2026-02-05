@@ -429,8 +429,10 @@ class AhrefsClient:
         return sorted(set(out)), f"/refdomains (relaxed - {len(sorted(set(out)))} domains)"
 
     # Step 1: Get qualifying domains using /refdomains (supports DR/Traffic filters)
-    def fetch_qualifying_refdomains(self, target: str, days: int) -> Set[str]:
-        """Get domains that meet DR30+ and Traffic 3000+ criteria using /refdomains endpoint"""
+    def fetch_qualifying_refdomains(self, target: str, days: int, show_debug: bool = False) -> Tuple[Set[str], Optional[str]]:
+        """Get domains that meet DR30+ and Traffic 3000+ criteria using /refdomains endpoint
+        Returns: (domains_set, error_message_if_any)
+        """
         start_iso, end_iso = iso_window_last_n_days(days)
         # Use /refdomains endpoint which supports DR and Traffic filters
         where_obj = {"and":[
@@ -457,19 +459,30 @@ class AhrefsClient:
                 if cand:
                     reg = extract_registrable_domain(cand)
                     if reg: domains.add(reg)
-            return domains
-        except requests.HTTPError:
-            return set()
+            return domains, None
+        except requests.HTTPError as e:
+            error_msg = str(e)
+            if show_debug:
+                st.warning(f"⚠️ /refdomains filter failed for {target}: {error_msg[:200]}")
+            return set(), error_msg
     
     # Step 2: Fetch backlinks only for qualifying domains
-    def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
+    def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain", show_debug: bool = False) -> List[Dict[str, Any]]:
         """ULTRA-OPTIMIZED: Two-step approach - get qualifying domains first, then fetch their backlinks"""
         start_iso, end_iso = iso_window_last_n_days(days)
         
         # Step 1: Get domains that meet DR30+ and Traffic 3000+ criteria
-        qualifying_domains = self.fetch_qualifying_refdomains(target, days)
+        qualifying_domains, error_msg = self.fetch_qualifying_refdomains(target, days, show_debug=show_debug)
         
-        if not qualifying_domains:
+        if error_msg and "domain_rating" in error_msg.lower():
+            # If DR/Traffic filters don't work, fallback: fetch all backlinks without quality filters
+            if show_debug:
+                st.warning(f"⚠️ DR/Traffic filters not supported for {target}. Fetching all new backlinks without quality filters.")
+            qualifying_domains = None  # Signal to skip domain filtering
+        
+        if qualifying_domains is not None and not qualifying_domains:
+            if show_debug:
+                st.info(f"ℹ️ No qualifying domains (DR30+, Traffic 3000+) found for {target}")
             return []  # No qualifying domains found
         
         # Step 2: Fetch backlinks for date range (we'll filter by domain client-side)
@@ -491,7 +504,7 @@ class AhrefsClient:
             "where": json.dumps(where_obj),
         })
         
-        # Filter backlinks to only include those from qualifying domains
+        # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
         out = []
         for r in rows:
             uf = r.get("url_from")
@@ -499,10 +512,16 @@ class AhrefsClient:
                 # Extract domain from URL
                 host = url_to_host(uf)
                 reg = extract_registrable_domain(host)
-                # Only include if domain is in our qualifying set
-                if reg and reg in qualifying_domains:
+                # Only include if domain is in our qualifying set (or include all if filtering failed)
+                if qualifying_domains is None or (reg and reg in qualifying_domains):
                     fs = r.get("first_seen_link")
                     out.append({"source_url": uf, "first_seen": fs, "raw": r})
+        
+        if show_debug and qualifying_domains:
+            st.info(f"✅ Found {len(out)} backlinks from {len(qualifying_domains)} qualifying domains for {target}")
+        elif show_debug:
+            st.info(f"✅ Found {len(out)} new backlinks for {target} (quality filters not applied)")
+        
         return out
 
 # ---------------- cache ----------------
@@ -802,12 +821,14 @@ def run_pipeline(force_refresh_cache: bool = False):
     
     def fetch_comp(comp: str) -> List[Dict[str, Any]]:
         try:
-            rows = ah.fetch_new_backlinks_last_n_days(comp, days=days, mode="domain")
+            rows = ah.fetch_new_backlinks_last_n_days(comp, days=days, mode="domain", show_debug=show_debug)
             return [{"_debug": f"{comp}: {len(rows)} new"}] + rows
         except requests.HTTPError as e:
             if "API units limit reached" in str(e):
                 return [{"_error": f"{comp}: API limit reached - skipping"}] + [{"_api_limit": True}]
             return [{"_error": f"{comp}: {e}"}]
+        except Exception as e:
+            return [{"_error": f"{comp}: Unexpected error - {str(e)[:200]}"}]
     
     if competitors:
         prog = st.progress(0.0); done=0
