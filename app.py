@@ -591,23 +591,57 @@ class AhrefsClient:
                     sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
                     st.write(f"   Sample first_seen dates: {sample_dates}")
             
-            # Trust the history parameter to do date filtering - don't do strict client-side filtering
-            # The history parameter should handle date filtering server-side
-            # Only do a loose check to ensure we have first_seen_link
+            # Filter by date client-side to ensure we only get backlinks in the specified date range
+            # The history parameter might return all backlinks since that date, not just the last N days
             if rows:
                 filtered_rows = []
                 missing_date_count = 0
+                out_of_range_count = 0
+                date_parse_errors = 0
+                
+                # Parse the date range once
+                try:
+                    start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                    end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                except Exception as e:
+                    if show_debug:
+                        st.error(f"❌ {target}: Error parsing date range: {str(e)}")
+                    start_dt = None
+                    end_dt = None
+                
                 for r in rows:
                     fs = r.get("first_seen_link")
-                    if fs:
-                        # Include all rows that have a first_seen_link - trust history parameter for date range
-                        filtered_rows.append(r)
-                    else:
-                        # If no first_seen_link, exclude it (we need dates)
+                    if not fs:
                         missing_date_count += 1
+                        continue
+                    
+                    # Parse and check if date is in range
+                    try:
+                        fs_str = fs.replace("Z", "+00:00")
+                        fs_dt = datetime.fromisoformat(fs_str)
+                        
+                        # Only include if date is within our range
+                        if start_dt and end_dt:
+                            if start_dt <= fs_dt <= end_dt:
+                                filtered_rows.append(r)
+                            else:
+                                out_of_range_count += 1
+                        else:
+                            # If date parsing failed, include it (better to include than exclude)
+                            filtered_rows.append(r)
+                    except Exception as parse_err:
+                        date_parse_errors += 1
+                        # If date parsing fails, exclude it to be safe
+                        if show_debug and date_parse_errors <= 3:
+                            st.write(f"⚠️ Could not parse date '{fs}': {str(parse_err)[:50]}")
+                
                 rows = filtered_rows
                 if show_debug:
-                    st.info(f"📅 {target}: After filtering (removed {missing_date_count} without first_seen_link): {len(rows)} backlinks")
+                    st.info(f"📅 {target}: After date filtering ({start_iso[:10]} to {end_iso[:10]}):")
+                    st.write(f"   • Included: {len(rows)} backlinks")
+                    st.write(f"   • Excluded (out of range): {out_of_range_count}")
+                    st.write(f"   • Excluded (missing date): {missing_date_count}")
+                    st.write(f"   • Date parse errors: {date_parse_errors}")
                     if len(rows) > 0:
                         # Show sample dates to verify they're in the right range
                         sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
