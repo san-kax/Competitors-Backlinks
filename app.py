@@ -432,13 +432,14 @@ class AhrefsClient:
     def fetch_qualifying_refdomains(self, target: str, days: int, show_debug: bool = False) -> Tuple[Set[str], Optional[str]]:
         """Get domains that meet DR30+ and Traffic 3000+ criteria using /refdomains endpoint
         Returns: (domains_set, error_message_if_any)
+        NOTE: /refdomains endpoint may not support first_seen_link filter, so we only filter by DR/Traffic
         """
         start_iso, end_iso = iso_window_last_n_days(days)
         # Use /refdomains endpoint which supports DR and Traffic filters
+        # NOTE: first_seen_link may not be supported in /refdomains, so we only filter by DR/Traffic
+        # We'll filter by date when fetching backlinks instead
         where_obj = {"and":[
-            {"field":"first_seen_link","is":["gte",start_iso]},
-            {"field":"first_seen_link","is":["lte",end_iso]},
-            {"field":"last_seen","is":"is_null"},
+            {"field":"last_seen","is":"is_null"},  # Live links only
             {"field":"domain_rating","is":["gte",30]},  # DR30+
             {"field":"traffic","is":["gte",3000]}  # Traffic 3000+
         ]}
@@ -447,18 +448,30 @@ class AhrefsClient:
                 "target": f"{target}/",
                 "mode": "subdomains",
                 "limit": 50000,
-                "history": f"since:{start_iso[:10]}",
+                "history": "all_time",  # Use all_time since date filtering may not be supported
                 "protocol": "both",
-                "select": "domain",  # Only need domain field
+                "select": "domain,domain_rating,traffic",  # Get DR and traffic to filter client-side if where doesn't work
                 "where": json.dumps(where_obj),
             }
             rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=False)
             domains = set()
             for r in rows:
+                # Check DR and Traffic if where filter didn't work
+                dr = r.get("domain_rating") or r.get("dr") or 0
+                traffic = r.get("traffic") or r.get("organic_traffic") or 0
+                
+                # Filter client-side if server-side filter didn't work
+                if isinstance(dr, (int, float)) and isinstance(traffic, (int, float)):
+                    if dr < 30 or traffic < 3000:
+                        continue  # Skip domains that don't meet criteria
+                
                 cand = r.get("domain") or r.get("referring_domain") or r.get("host")
                 if cand:
                     reg = extract_registrable_domain(cand)
                     if reg: domains.add(reg)
+            
+            if show_debug:
+                st.info(f"📊 {target}: Found {len(domains)} qualifying domains (DR30+, Traffic 3000+)")
             return domains, None
         except requests.HTTPError as e:
             error_msg = str(e)
@@ -471,58 +484,69 @@ class AhrefsClient:
         """ULTRA-OPTIMIZED: Two-step approach - get qualifying domains first, then fetch their backlinks"""
         start_iso, end_iso = iso_window_last_n_days(days)
         
-        # Step 1: Get domains that meet DR30+ and Traffic 3000+ criteria
+        # Step 1: Try to get domains that meet DR30+ and Traffic 3000+ criteria
         qualifying_domains, error_msg = self.fetch_qualifying_refdomains(target, days, show_debug=show_debug)
         
-        if error_msg and "domain_rating" in error_msg.lower():
-            # If DR/Traffic filters don't work, fallback: fetch all backlinks without quality filters
+        # If DR/Traffic filters fail, fallback to fetching all backlinks
+        use_quality_filter = True
+        if error_msg:
             if show_debug:
-                st.warning(f"⚠️ DR/Traffic filters not supported for {target}. Fetching all new backlinks without quality filters.")
-            qualifying_domains = None  # Signal to skip domain filtering
-        
-        if qualifying_domains is not None and not qualifying_domains:
+                st.warning(f"⚠️ {target}: Quality filter failed ({error_msg[:150]}). Fetching all new backlinks.")
+            use_quality_filter = False
+            qualifying_domains = None
+        elif not qualifying_domains:
             if show_debug:
-                st.info(f"ℹ️ No qualifying domains (DR30+, Traffic 3000+) found for {target}")
-            return []  # No qualifying domains found
+                st.info(f"ℹ️ {target}: No domains found with DR30+ and Traffic 3000+ in last {days} days. Fetching all new backlinks.")
+            use_quality_filter = False
+            qualifying_domains = None
         
-        # Step 2: Fetch backlinks for date range (we'll filter by domain client-side)
+        # Step 2: Fetch backlinks for date range
         where_obj = {"and":[
             {"field":"first_seen_link","is":["gte",start_iso]},
             {"field":"first_seen_link","is":["lte",end_iso]},
             {"field":"last_seen","is":"is_null"}
         ]}
         
-        rows = self._paginate(self.EP_BACKLINKS, {
-            "target": f"{target}/",
-            "mode": "subdomains",
-            "limit": 50000,
-            "history": f"since:{start_iso[:10]}",
-            "order_by": "ahrefs_rank_source:asc",
-            "aggregation": "1_per_domain",
-            "protocol":"both",
-            "select": "url_from,first_seen_link",
-            "where": json.dumps(where_obj),
-        })
-        
-        # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
-        out = []
-        for r in rows:
-            uf = r.get("url_from")
-            if uf:
-                # Extract domain from URL
-                host = url_to_host(uf)
-                reg = extract_registrable_domain(host)
-                # Only include if domain is in our qualifying set (or include all if filtering failed)
-                if qualifying_domains is None or (reg and reg in qualifying_domains):
-                    fs = r.get("first_seen_link")
-                    out.append({"source_url": uf, "first_seen": fs, "raw": r})
-        
-        if show_debug and qualifying_domains:
-            st.info(f"✅ Found {len(out)} backlinks from {len(qualifying_domains)} qualifying domains for {target}")
-        elif show_debug:
-            st.info(f"✅ Found {len(out)} new backlinks for {target} (quality filters not applied)")
-        
-        return out
+        try:
+            rows = self._paginate(self.EP_BACKLINKS, {
+                "target": f"{target}/",
+                "mode": "subdomains",
+                "limit": 50000,
+                "history": f"since:{start_iso[:10]}",
+                "order_by": "ahrefs_rank_source:asc",
+                "aggregation": "1_per_domain",
+                "protocol":"both",
+                "select": "url_from,first_seen_link",
+                "where": json.dumps(where_obj),
+            })
+            
+            if show_debug:
+                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API")
+            
+            # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
+            out = []
+            for r in rows:
+                uf = r.get("url_from")
+                if uf:
+                    # Extract domain from URL
+                    host = url_to_host(uf)
+                    reg = extract_registrable_domain(host)
+                    # Only include if domain is in our qualifying set (or include all if filtering failed)
+                    if not use_quality_filter or (reg and reg in qualifying_domains):
+                        fs = r.get("first_seen_link")
+                        out.append({"source_url": uf, "first_seen": fs, "raw": r})
+            
+            if show_debug:
+                if use_quality_filter and qualifying_domains:
+                    st.success(f"✅ {target}: {len(out)} backlinks from {len(qualifying_domains)} qualifying domains (DR30+, Traffic 3000+)")
+                else:
+                    st.success(f"✅ {target}: {len(out)} new backlinks (quality filters not applied)")
+            
+            return out
+        except Exception as e:
+            if show_debug:
+                st.error(f"❌ {target}: Error fetching backlinks - {str(e)[:200]}")
+            return []
 
 # ---------------- cache ----------------
 DB_PATH = "./backlink_cache.sqlite"
