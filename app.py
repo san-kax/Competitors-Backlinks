@@ -1,4 +1,4 @@
-# v2.0.0 — MAXIMUM OPTIMIZATION for minimum Ahrefs API credits:
+# v2.1.0 — FIXED & OPTIMIZED for minimum Ahrefs API credits:
 #   • Single /refdomains call with server-side DR30+/Traffic3000+ filters (vs two-step approach)
 #   • DR and Traffic included in output (fetched in same call - no extra credits)
 #   • Parallel Airtable fetches (competitors + blocklists simultaneously)
@@ -243,84 +243,6 @@ class AhrefsClient:
         except requests.HTTPError as e:
             return [], f"/refdomains failed ({str(e)[:90]}…)"
 
-    def fetch_qualified_refdomains_with_metrics(
-        self,
-        target: str,
-        days: int,
-        min_dr: int = 30,
-        min_traffic: int = 3000,
-        show_debug: bool = False
-    ) -> List[Dict[str, Any]]:
-        """
-        MAXIMUM OPTIMIZATION: Single API call to get qualifying domains WITH metrics.
-
-        Strategy:
-        - Use /refdomains endpoint with server-side DR/Traffic filters
-        - Fetch domain, domain_rating, traffic in ONE call
-        - Returns domains with their metrics (for output file)
-        - NO separate call needed for metrics - saves 50%+ API credits
-        """
-        start_iso, end_iso = iso_window_last_n_days(days)
-
-        if target == "gambling.com":
-            target = "www.gambling.com"
-
-        # Server-side filters for DR30+ and Traffic 3000+
-        where_obj = {
-            "and": [
-                {"field": "domain_rating", "is": ["gte", min_dr]},
-                {"field": "traffic", "is": ["gte", min_traffic]}
-            ]
-        }
-
-        params = {
-            "target": f"{target}/",
-            "mode": "subdomains",
-            "limit": 50000,
-            "history": "all_time",
-            "protocol": "both",
-            # OPTIMIZED: Get DR and Traffic in same call - no extra API cost
-            "select": "domain,domain_rating,traffic",
-            "where": json.dumps(where_obj),
-        }
-
-        try:
-            rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=False)
-
-            results = []
-            for r in rows:
-                domain = r.get("domain") or r.get("referring_domain") or r.get("host")
-                if not domain:
-                    continue
-
-                reg = extract_registrable_domain(domain)
-                if not reg:
-                    continue
-
-                dr = r.get("domain_rating") or r.get("dr") or 0
-                traffic = r.get("traffic") or r.get("organic_traffic") or 0
-
-                # Double-check filters client-side (in case server filter failed)
-                if isinstance(dr, (int, float)) and isinstance(traffic, (int, float)):
-                    if dr >= min_dr and traffic >= min_traffic:
-                        # Cache metrics for later use
-                        self._domain_metrics_cache[reg] = {"dr": dr, "traffic": traffic}
-                        results.append({
-                            "domain": reg,
-                            "dr": int(dr),
-                            "traffic": int(traffic)
-                        })
-
-            if show_debug:
-                st.info(f"📊 {target}: {len(results)} domains with DR{min_dr}+ and Traffic {min_traffic:,}+")
-
-            return results
-
-        except requests.HTTPError as e:
-            if show_debug:
-                st.warning(f"⚠️ {target}: API error - {str(e)[:150]}")
-            return []
-
     def fetch_new_backlinks_with_metrics(
         self,
         target: str,
@@ -330,31 +252,21 @@ class AhrefsClient:
         show_debug: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        OPTIMIZED: Fetch new backlinks from qualifying domains with DR/Traffic metrics.
+        FIXED & OPTIMIZED: Fetch new backlinks first, then filter by DR/Traffic.
 
-        Two-phase approach (but optimized):
-        1. Get qualifying domains with metrics in ONE call (cached)
-        2. Fetch backlinks filtered by date
-        3. Match backlinks to cached domain metrics
+        Strategy (corrected):
+        1. Fetch ALL new backlinks from date range
+        2. Include DR/Traffic data if available from API
+        3. Apply filter only if DR/Traffic data is actually present
+
+        This ensures we don't miss new backlinks.
         """
         start_iso, end_iso = iso_window_last_n_days(days)
 
         if target == "gambling.com":
             target = "www.gambling.com"
 
-        # Phase 1: Get qualifying domains with metrics (single call)
-        qualified = self.fetch_qualified_refdomains_with_metrics(
-            target, days, min_dr, min_traffic, show_debug
-        )
-
-        if not qualified:
-            if show_debug:
-                st.info(f"ℹ️ {target}: No domains meet DR{min_dr}+/Traffic{min_traffic}+ criteria")
-            return []
-
-        qualifying_domains = {d["domain"] for d in qualified}
-
-        # Phase 2: Fetch backlinks for date range (minimal fields)
+        # Fetch new backlinks with date filter
         where_obj = {
             "and": [
                 {"field": "first_seen_link", "is": ["gte", start_iso]},
@@ -372,10 +284,124 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol": "both",
-                # MINIMAL fields - just what we need
-                "select": "url_from,first_seen_link",
+                # Request all potentially useful fields
+                "select": "url_from,first_seen_link,domain_rating_source,traffic_domain",
                 "where": json.dumps(where_obj),
             })
+
+            if show_debug:
+                st.info(f"📊 {target}: Found {len(rows)} new backlinks in date range")
+                # Debug: show first row structure
+                if rows:
+                    st.write(f"🔍 Sample row keys: {list(rows[0].keys())}")
+
+            if not rows:
+                return []
+
+            # Process results
+            results = []
+            has_dr_data = False
+
+            for r in rows:
+                url = r.get("url_from")
+                if not url:
+                    continue
+
+                host = url_to_host(url)
+                reg = extract_registrable_domain(host)
+                if not reg:
+                    continue
+
+                # Get DR and Traffic - try multiple field names
+                dr = r.get("domain_rating_source") or r.get("domain_rating") or r.get("dr")
+                traffic = r.get("traffic_domain") or r.get("traffic") or r.get("organic_traffic")
+
+                # Convert to int safely
+                try:
+                    dr = int(dr) if dr is not None else None
+                    traffic = int(traffic) if traffic is not None else None
+                except (ValueError, TypeError):
+                    dr = None
+                    traffic = None
+
+                # Track if we have any DR data
+                if dr is not None and dr > 0:
+                    has_dr_data = True
+
+                # If we have DR/Traffic data, apply filter
+                # If no DR/Traffic data available, include all results
+                if dr is not None and traffic is not None:
+                    if dr >= min_dr and traffic >= min_traffic:
+                        results.append({
+                            "source_url": url,
+                            "first_seen": r.get("first_seen_link"),
+                            "domain": reg,
+                            "dr": dr,
+                            "traffic": traffic
+                        })
+                else:
+                    # No DR/Traffic data - include anyway with 0 values
+                    results.append({
+                        "source_url": url,
+                        "first_seen": r.get("first_seen_link"),
+                        "domain": reg,
+                        "dr": dr if dr is not None else 0,
+                        "traffic": traffic if traffic is not None else 0
+                    })
+
+            if show_debug:
+                if has_dr_data:
+                    st.success(f"✅ {target}: {len(results)} backlinks (DR/Traffic filter applied)")
+                else:
+                    st.warning(f"⚠️ {target}: {len(results)} backlinks (DR/Traffic data not available - no filter applied)")
+
+            return results
+
+        except requests.HTTPError as e:
+            if show_debug:
+                st.error(f"❌ {target}: {str(e)[:200]}")
+            return []
+
+    def fetch_new_backlinks_all(
+        self,
+        target: str,
+        days: int,
+        show_debug: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch ALL new backlinks without DR/Traffic filter.
+        Used when we want to get all data and filter client-side.
+        """
+        start_iso, end_iso = iso_window_last_n_days(days)
+
+        if target == "gambling.com":
+            target = "www.gambling.com"
+
+        where_obj = {
+            "and": [
+                {"field": "first_seen_link", "is": ["gte", start_iso]},
+                {"field": "first_seen_link", "is": ["lte", end_iso]},
+                {"field": "last_seen", "is": "is_null"}
+            ]
+        }
+
+        try:
+            rows = self._paginate(self.EP_BACKLINKS, {
+                "target": f"{target}/",
+                "mode": "subdomains",
+                "limit": 50000,
+                "history": f"since:{start_iso[:10]}",
+                "order_by": "ahrefs_rank_source:asc",
+                "aggregation": "1_per_domain",
+                "protocol": "both",
+                "select": "url_from,first_seen_link,domain_rating_source,traffic_domain",
+                "where": json.dumps(where_obj),
+            })
+
+            if show_debug:
+                st.info(f"📊 {target}: Found {len(rows)} new backlinks (no filter)")
+                if rows:
+                    st.write(f"🔍 Sample row keys: {list(rows[0].keys())}")
 
             results = []
             for r in rows:
@@ -385,21 +411,29 @@ class AhrefsClient:
 
                 host = url_to_host(url)
                 reg = extract_registrable_domain(host)
+                if not reg:
+                    continue
 
-                # Only include if domain meets quality criteria
-                if reg and reg in qualifying_domains:
-                    # Get cached metrics
-                    metrics = self._domain_metrics_cache.get(reg, {"dr": 0, "traffic": 0})
-                    results.append({
-                        "source_url": url,
-                        "first_seen": r.get("first_seen_link"),
-                        "domain": reg,
-                        "dr": metrics.get("dr", 0),
-                        "traffic": metrics.get("traffic", 0)
-                    })
+                dr = r.get("domain_rating_source") or r.get("domain_rating") or 0
+                traffic = r.get("traffic_domain") or r.get("traffic") or 0
+
+                try:
+                    dr = int(dr) if dr else 0
+                    traffic = int(traffic) if traffic else 0
+                except (ValueError, TypeError):
+                    dr = 0
+                    traffic = 0
+
+                results.append({
+                    "source_url": url,
+                    "first_seen": r.get("first_seen_link"),
+                    "domain": reg,
+                    "dr": dr,
+                    "traffic": traffic
+                })
 
             if show_debug:
-                st.success(f"✅ {target}: {len(results)} new backlinks from {len(qualifying_domains)} qualified domains")
+                st.info(f"📊 {target}: {len(results)} total new backlinks")
 
             return results
 
@@ -502,8 +536,12 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 Quality Filters")
-    min_dr = st.number_input("Minimum DR", min_value=0, max_value=100, value=30)
-    min_traffic = st.number_input("Minimum Traffic", min_value=0, max_value=1000000, value=3000)
+    enable_quality_filter = st.checkbox("Enable DR/Traffic filter", value=True,
+                                        help="Uncheck to get ALL backlinks regardless of DR/Traffic")
+    min_dr = st.number_input("Minimum DR", min_value=0, max_value=100, value=30,
+                             disabled=not enable_quality_filter)
+    min_traffic = st.number_input("Minimum Traffic", min_value=0, max_value=1000000, value=3000,
+                                  disabled=not enable_quality_filter)
 
     st.divider()
     st.subheader("⚡ Performance")
@@ -695,7 +733,10 @@ def run_pipeline(force_refresh_cache: bool = False):
     # PHASE 3: Fetch competitor backlinks (Parallel)
     # ============================================
     st.write("## 🔍 Phase 3: Competitor Backlinks")
-    st.info(f"**Filters:** DR ≥ {min_dr}, Traffic ≥ {min_traffic:,} | **Window:** Last {days} days")
+    if enable_quality_filter:
+        st.info(f"**Filters:** DR ≥ {min_dr}, Traffic ≥ {min_traffic:,} | **Window:** Last {days} days")
+    else:
+        st.info(f"**Filters:** None (fetching ALL backlinks) | **Window:** Last {days} days")
 
     output_records: List[Dict[str, Any]] = []
     api_errors: List[str] = []
@@ -704,13 +745,20 @@ def run_pipeline(force_refresh_cache: bool = False):
     def fetch_competitor_backlinks(comp: str) -> List[Dict[str, Any]]:
         """Fetch backlinks for a single competitor."""
         try:
-            return ah.fetch_new_backlinks_with_metrics(
-                comp,
-                days=days,
-                min_dr=min_dr,
-                min_traffic=min_traffic,
-                show_debug=show_debug
-            )
+            if enable_quality_filter:
+                return ah.fetch_new_backlinks_with_metrics(
+                    comp,
+                    days=days,
+                    min_dr=min_dr,
+                    min_traffic=min_traffic,
+                    show_debug=show_debug
+                )
+            else:
+                return ah.fetch_new_backlinks_all(
+                    comp,
+                    days=days,
+                    show_debug=show_debug
+                )
         except requests.HTTPError as e:
             if "API units limit reached" in str(e):
                 api_errors.append(f"{comp}: API limit reached")
@@ -840,9 +888,10 @@ if refresh_cache_btn:
 # Footer
 st.divider()
 st.caption("""
-**v2.0.0** — Maximum API Credit Optimization
-- Single /refdomains call with server-side DR/Traffic filters
-- DR and Traffic included in output (same API call)
+**v2.1.0** — Fixed & Optimized
+- Fixed: Now fetches backlinks first, then filters by DR/Traffic
+- DR/Traffic filter can be disabled to get ALL backlinks
+- DR and Traffic included in output
 - Parallel Airtable fetches
 - LRU caching for domain extraction
 - Optimized connection pooling
