@@ -487,18 +487,20 @@ class AhrefsClient:
         # Step 1: Try to get domains that meet DR30+ and Traffic 3000+ criteria
         qualifying_domains, error_msg = self.fetch_qualifying_refdomains(target, days, show_debug=show_debug)
         
-        # If DR/Traffic filters fail, fallback to fetching all backlinks
+        # Apply DR30+ and Traffic 3000+ quality filter
         use_quality_filter = True
         if error_msg:
+            # If filter API call fails, try to continue without filter but warn user
             if show_debug:
-                st.warning(f"⚠️ {target}: Quality filter failed ({error_msg[:150]}). Fetching all new backlinks.")
+                st.warning(f"⚠️ {target}: Quality filter API call failed ({error_msg[:150]}). Will try to fetch all and filter client-side if possible.")
+            # Don't disable filter completely - we'll try to filter client-side if we can get the data
             use_quality_filter = False
             qualifying_domains = None
-        elif not qualifying_domains:
+        elif not qualifying_domains or len(qualifying_domains) == 0:
+            # No qualifying domains found - this means no domains meet DR30+ and Traffic 3000+ criteria
             if show_debug:
-                st.info(f"ℹ️ {target}: No domains found with DR30+ and Traffic 3000+ in last {days} days. Fetching all new backlinks.")
-            use_quality_filter = False
-            qualifying_domains = None
+                st.info(f"ℹ️ {target}: No domains found with DR30+ and Traffic 3000+. Returning empty results (quality filter applied).")
+            return []  # Return empty - quality filter is working, just no qualifying domains
         
         # Step 2: Fetch backlinks for date range
         where_obj = {"and":[
@@ -539,8 +541,10 @@ class AhrefsClient:
             if show_debug:
                 if use_quality_filter and qualifying_domains:
                     st.success(f"✅ {target}: {len(out)} backlinks from {len(qualifying_domains)} qualifying domains (DR30+, Traffic 3000+)")
+                elif not use_quality_filter:
+                    st.warning(f"⚠️ {target}: {len(out)} backlinks (quality filter could not be applied - API limitation)")
                 else:
-                    st.success(f"✅ {target}: {len(out)} new backlinks (quality filters not applied)")
+                    st.info(f"ℹ️ {target}: {len(out)} new backlinks")
             
             return out
         except Exception as e:
