@@ -428,47 +428,81 @@ class AhrefsClient:
                 if reg: out.append(reg)
         return sorted(set(out)), f"/refdomains (relaxed - {len(sorted(set(out)))} domains)"
 
-    # New backlinks (last N days) — ULTRA-OPTIMIZED for minimum API credits
-    def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
-        """ULTRA-OPTIMIZED: Single API call with minimal fields and aggregation to minimize API credits"""
+    # Step 1: Get qualifying domains using /refdomains (supports DR/Traffic filters)
+    def fetch_qualifying_refdomains(self, target: str, days: int) -> Set[str]:
+        """Get domains that meet DR30+ and Traffic 3000+ criteria using /refdomains endpoint"""
         start_iso, end_iso = iso_window_last_n_days(days)
-        # Filter: Date range and live links only
-        # NOTE: DR and Traffic filters may not be available in where clause for /all-backlinks endpoint
-        # We'll filter client-side after fetching, or use /refdomains endpoint which supports these filters
+        # Use /refdomains endpoint which supports DR and Traffic filters
+        where_obj = {"and":[
+            {"field":"first_seen_link","is":["gte",start_iso]},
+            {"field":"first_seen_link","is":["lte",end_iso]},
+            {"field":"last_seen","is":"is_null"},
+            {"field":"domain_rating","is":["gte",30]},  # DR30+
+            {"field":"traffic","is":["gte",3000]}  # Traffic 3000+
+        ]}
+        try:
+            params = {
+                "target": f"{target}/",
+                "mode": "subdomains",
+                "limit": 50000,
+                "history": f"since:{start_iso[:10]}",
+                "protocol": "both",
+                "select": "domain",  # Only need domain field
+                "where": json.dumps(where_obj),
+            }
+            rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=False)
+            domains = set()
+            for r in rows:
+                cand = r.get("domain") or r.get("referring_domain") or r.get("host")
+                if cand:
+                    reg = extract_registrable_domain(cand)
+                    if reg: domains.add(reg)
+            return domains
+        except requests.HTTPError:
+            return set()
+    
+    # Step 2: Fetch backlinks only for qualifying domains
+    def fetch_new_backlinks_last_n_days(self, target: str, days: int, mode: str = "domain") -> List[Dict[str, Any]]:
+        """ULTRA-OPTIMIZED: Two-step approach - get qualifying domains first, then fetch their backlinks"""
+        start_iso, end_iso = iso_window_last_n_days(days)
+        
+        # Step 1: Get domains that meet DR30+ and Traffic 3000+ criteria
+        qualifying_domains = self.fetch_qualifying_refdomains(target, days)
+        
+        if not qualifying_domains:
+            return []  # No qualifying domains found
+        
+        # Step 2: Fetch backlinks for date range (we'll filter by domain client-side)
         where_obj = {"and":[
             {"field":"first_seen_link","is":["gte",start_iso]},
             {"field":"first_seen_link","is":["lte",end_iso]},
             {"field":"last_seen","is":"is_null"}
         ]}
-        # ULTRA-OPTIMIZED for minimum API credits:
-        # 1. Minimal select: only url_from and first_seen_link (2 fields vs 30+ = ~93% reduction)
-        # 2. Aggregation: 1_per_domain reduces duplicate results = fewer API units consumed
-        # 3. High limit: reduces pagination overhead
-        # 4. Filters applied server-side (no need to select DR/traffic fields for filtering)
+        
         rows = self._paginate(self.EP_BACKLINKS, {
             "target": f"{target}/",
             "mode": "subdomains",
-            "limit": 50000,  # High limit reduces pagination calls
+            "limit": 50000,
             "history": f"since:{start_iso[:10]}",
-            "order_by": "traffic:desc",  # Get best results first
-            "aggregation": "1_per_domain",  # CRITICAL: Reduces duplicates = fewer API units
+            "order_by": "ahrefs_rank_source:asc",
+            "aggregation": "1_per_domain",
             "protocol":"both",
-            "select": "url_from,first_seen_link,dr,traffic",  # Need dr and traffic for client-side filtering
+            "select": "url_from,first_seen_link",
             "where": json.dumps(where_obj),
         })
-        out=[]
+        
+        # Filter backlinks to only include those from qualifying domains
+        out = []
         for r in rows:
-            uf = r.get("url_from"); fs = r.get("first_seen_link")
-            # Get DR and Traffic values (try multiple field name variations)
-            dr = r.get("dr") or r.get("domain_rating") or r.get("domain_rating_value") or 0
-            traffic = r.get("traffic") or r.get("organic_traffic") or r.get("traffic_value") or 0
-            # Client-side filtering: DR30+ and Traffic 3000+
-            if isinstance(dr, (int, float)) and isinstance(traffic, (int, float)):
-                if dr >= 30 and traffic >= 3000:
-                    if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
-            else:
-                # If DR/traffic not available, include all results (fallback)
-                if uf: out.append({"source_url": uf, "first_seen": fs, "raw": r})
+            uf = r.get("url_from")
+            if uf:
+                # Extract domain from URL
+                host = url_to_host(uf)
+                reg = extract_registrable_domain(host)
+                # Only include if domain is in our qualifying set
+                if reg and reg in qualifying_domains:
+                    fs = r.get("first_seen_link")
+                    out.append({"source_url": uf, "first_seen": fs, "raw": r})
         return out
 
 # ---------------- cache ----------------
@@ -756,13 +790,13 @@ def run_pipeline(force_refresh_cache: bool = False):
         st.warning(f"⚠️ Expected ~32,200 domains but only got {len(gdc_ref_domains)}. Check if pagination is working correctly.")
     gdc_ref_set = set(gdc_ref_domains)
 
-    # 4) New backlinks per competitor (threaded) - ULTRA-OPTIMIZED: minimum API credits
+    # 4) New backlinks per competitor (threaded) - ULTRA-OPTIMIZED: minimum API credits with quality filters
     st.write("## 4) Fetching new backlinks from Ahrefs (last N days) - ULTRA-OPTIMIZED")
-    st.info("💡 **API Credit Optimizations:**")
-    st.info("   • Minimal fields: Only `url_from`, `first_seen_link`, `dr`, `traffic` (4 fields vs 30+ = ~87% reduction)")
-    st.info("   • Aggregation: `1_per_domain` reduces duplicates = fewer API units consumed")
-    st.info("   • Client-side filtering: DR30+ and Traffic 3000+ filters applied after fetch")
-    st.info("🎯 Quality filters: DR30+ and Traffic 3000+ only (applied client-side)")
+    st.info("💡 **Two-Step Approach for Quality Filtering:**")
+    st.info("   • Step 1: Use `/refdomains` endpoint to get domains with DR30+ and Traffic 3000+")
+    st.info("   • Step 2: Fetch backlinks and filter to only include qualifying domains")
+    st.info("🎯 **Quality filters:** DR30+ and Traffic 3000+ (applied via /refdomains endpoint)")
+    st.info("⚡ **Optimizations:** Minimal fields, aggregation, high limits")
     output_records: List[Dict[str, Any]] = []
     api_limit_hit = False
     
