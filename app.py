@@ -518,7 +518,7 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol":"both",
-                "select": "url_from,first_seen_link,domain_rating_source,traffic_source",
+                "select": "url_from,first_seen_link",  # Minimal fields - DR/Traffic not available in /all-backlinks
                 # No where clause - let history parameter do the filtering
             })
             if show_debug:
@@ -540,7 +540,7 @@ class AhrefsClient:
                     "order_by": "ahrefs_rank_source:asc",
                     "aggregation": "1_per_domain",
                     "protocol":"both",
-                    "select": "url_from,first_seen_link,domain_rating_source,traffic_source",
+                    "select": "url_from,first_seen_link",  # Minimal fields
                     "where": json.dumps(where_obj),  # Only last_seen filter
                 })
                 if show_debug:
@@ -567,7 +567,7 @@ class AhrefsClient:
                         "order_by": "ahrefs_rank_source:asc",
                         "aggregation": "1_per_domain",
                         "protocol":"both",
-                        "select": "url_from,first_seen_link,domain_rating_source,traffic_source",
+                        "select": "url_from,first_seen_link",  # Minimal fields
                         "where": json.dumps(where_obj_with_date),
                     })
                     if show_debug:
@@ -591,37 +591,27 @@ class AhrefsClient:
                     sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
                     st.write(f"   Sample first_seen dates: {sample_dates}")
             
-            # Filter by date client-side to ensure we only get backlinks in our date range
-            # The history parameter might return more than we need
+            # Trust the history parameter to do date filtering - don't do strict client-side filtering
+            # The history parameter should handle date filtering server-side
+            # Only do a loose check to ensure we have first_seen_link
             if rows:
                 filtered_rows = []
-                date_parse_errors = 0
+                missing_date_count = 0
                 for r in rows:
                     fs = r.get("first_seen_link")
                     if fs:
-                        try:
-                            # Parse ISO date and check if it's in our range
-                            fs_str = fs.replace("Z", "+00:00")
-                            fs_dt = datetime.fromisoformat(fs_str)
-                            start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                            if start_dt <= fs_dt <= end_dt:
-                                filtered_rows.append(r)
-                        except Exception as parse_err:
-                            # If date parsing fails, include the row anyway (better to include than exclude)
-                            date_parse_errors += 1
-                            if show_debug and date_parse_errors <= 3:
-                                st.write(f"⚠️ Could not parse date '{fs}': {str(parse_err)[:50]}")
-                            filtered_rows.append(r)
+                        # Include all rows that have a first_seen_link - trust history parameter for date range
+                        filtered_rows.append(r)
                     else:
-                        # If no first_seen_link, exclude it (we need dates for filtering)
-                        if show_debug:
-                            st.write(f"⚠️ Backlink missing first_seen_link field")
+                        # If no first_seen_link, exclude it (we need dates)
+                        missing_date_count += 1
                 rows = filtered_rows
                 if show_debug:
-                    st.info(f"📅 {target}: After date filtering ({start_iso[:10]} to {end_iso[:10]}): {len(rows)} backlinks")
-                    if date_parse_errors > 0:
-                        st.warning(f"⚠️ {date_parse_errors} backlinks had date parsing issues")
+                    st.info(f"📅 {target}: After filtering (removed {missing_date_count} without first_seen_link): {len(rows)} backlinks")
+                    if len(rows) > 0:
+                        # Show sample dates to verify they're in the right range
+                        sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
+                        st.write(f"   Sample first_seen dates: {sample_dates}")
             
             # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
             out = []
@@ -965,13 +955,23 @@ def run_pipeline(force_refresh_cache: bool = False):
     
     if competitors:
         prog = st.progress(0.0); done=0
+        debug_summary = []  # Collect debug info to show at the end
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
             for fut in as_completed([pool.submit(fetch_comp, c) for c in competitors]):
                 res = fut.result() or []
+                comp_name = None
+                row_count = 0
                 for r in res:
-                    if "_debug" in r and show_debug: st.write(r["_debug"])
+                    if "_debug" in r:
+                        comp_name = r["_debug"].split(":")[0] if ":" in r["_debug"] else "Unknown"
+                        row_count = int(r["_debug"].split()[-2]) if len(r["_debug"].split()) >= 2 else 0
+                        if show_debug:
+                            st.write(r["_debug"])
+                        debug_summary.append((comp_name, row_count, "success"))
                     elif "_error" in r: 
+                        comp_name = r["_error"].split(":")[0] if ":" in r["_error"] else "Unknown"
                         st.error(r["_error"])
+                        debug_summary.append((comp_name, 0, f"error: {r['_error'][:50]}"))
                         if "API limit reached" in r["_error"]:
                             api_limit_hit = True
                     elif "_api_limit" in r:
@@ -988,6 +988,27 @@ def run_pipeline(force_refresh_cache: bool = False):
                                 "traffic": r.get("traffic"),  # Traffic from backlink data if available
                             })
                 done += 1; prog.progress(done/len(competitors))
+        
+        # Show summary of what happened
+        if debug_summary:
+            st.write("---")
+            st.write("### 📊 Summary of API calls:")
+            total_backlinks = 0
+            for comp, count, status in debug_summary:
+                total_backlinks += count
+                if "error" in status:
+                    st.write(f"❌ **{comp}**: {status}")
+                elif count == 0:
+                    st.write(f"⚠️ **{comp}**: {count} backlinks (API returned 0 results - check debug output above for details)")
+                else:
+                    st.write(f"✅ **{comp}**: {count} backlinks")
+            st.write(f"**Total backlinks fetched**: {total_backlinks}")
+            if total_backlinks == 0:
+                st.warning("⚠️ **No backlinks were fetched from the API.** This could mean:")
+                st.write("1. No new backlinks exist in the specified date range")
+                st.write("2. The API endpoint or parameters are incorrect")
+                st.write("3. The date range calculation is wrong")
+                st.write("4. Check the debug output above for specific error messages")
 
     # Show API limit warning if hit
     if api_limit_hit:
