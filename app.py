@@ -118,7 +118,6 @@ class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     EP_BACKLINKS = "/site-explorer/all-backlinks"
     EP_REFDOMAINS = "/site-explorer/refdomains"
-    EP_DOMAIN_RATING = "/site-explorer/domain-rating"  # Alternative endpoint for domain metrics
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
         self.session = session or make_session()
@@ -485,31 +484,30 @@ class AhrefsClient:
         """ULTRA-OPTIMIZED: Two-step approach - get qualifying domains first, then fetch their backlinks"""
         start_iso, end_iso = iso_window_last_n_days(days)
         
-        # DISABLED quality filter for now - fetch all new backlinks
-        # Quality filtering can be re-enabled later if needed
-        use_quality_filter = False
-        qualifying_domains = None
+        # Step 1: Try to get domains that meet DR30+ and Traffic 3000+ criteria
+        qualifying_domains, error_msg = self.fetch_qualifying_refdomains(target, days, show_debug=show_debug)
+        
+        # If DR/Traffic filters fail, fallback to fetching all backlinks
+        use_quality_filter = True
+        if error_msg:
+            if show_debug:
+                st.warning(f"⚠️ {target}: Quality filter failed ({error_msg[:150]}). Fetching all new backlinks.")
+            use_quality_filter = False
+            qualifying_domains = None
+        elif not qualifying_domains:
+            if show_debug:
+                st.info(f"ℹ️ {target}: No domains found with DR30+ and Traffic 3000+ in last {days} days. Fetching all new backlinks.")
+            use_quality_filter = False
+            qualifying_domains = None
         
         # Step 2: Fetch backlinks for date range
-        # Simplify where clause - use history parameter for date filtering instead
         where_obj = {"and":[
-            {"field":"last_seen","is":"is_null"}  # Live links only
+            {"field":"first_seen_link","is":["gte",start_iso]},
+            {"field":"first_seen_link","is":["lte",end_iso]},
+            {"field":"last_seen","is":"is_null"}
         ]}
         
-        if show_debug:
-            st.info(f"🔍 {target}: Fetching backlinks from {start_iso[:10]} to {end_iso[:10]} (last {days} days)")
-            st.write(f"   Date range: {start_iso} to {end_iso}")
-            st.write(f"   Current time (UTC): {datetime.now(timezone.utc).isoformat()}")
-        
-        # Try multiple approaches - some APIs don't support date filters in where clause
-        rows = []
-        error_msg = None
-        
-        # Approach 1: Simplest - just history parameter, no where clause
-        # This is the most likely to work
         try:
-            if show_debug:
-                st.info(f"🔄 {target}: Trying Approach 1 (history only, no where clause)")
             rows = self._paginate(self.EP_BACKLINKS, {
                 "target": f"{target}/",
                 "mode": "subdomains",
@@ -518,134 +516,12 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol":"both",
-                "select": "url_from,first_seen_link",  # Minimal fields - DR/Traffic not available in /all-backlinks
-                # No where clause - let history parameter do the filtering
+                "select": "url_from,first_seen_link",
+                "where": json.dumps(where_obj),
             })
-            if show_debug:
-                st.success(f"✅ {target}: Approach 1 succeeded - got {len(rows)} rows from API")
-        except Exception as e1:
-            error_msg = str(e1)
-            if show_debug:
-                st.warning(f"⚠️ {target}: Approach 1 failed: {str(e1)[:200]}")
             
-            # Approach 2: Try with last_seen filter in where clause
-            try:
-                if show_debug:
-                    st.info(f"🔄 {target}: Trying Approach 2 (history + last_seen filter)")
-                rows = self._paginate(self.EP_BACKLINKS, {
-                    "target": f"{target}/",
-                    "mode": "subdomains",
-                    "limit": 50000,
-                    "history": f"since:{start_iso[:10]}",
-                    "order_by": "ahrefs_rank_source:asc",
-                    "aggregation": "1_per_domain",
-                    "protocol":"both",
-                    "select": "url_from,first_seen_link",  # Minimal fields
-                    "where": json.dumps(where_obj),  # Only last_seen filter
-                })
-                if show_debug:
-                    st.success(f"✅ {target}: Approach 2 succeeded - got {len(rows)} rows from API")
-            except Exception as e2:
-                error_msg = str(e2)
-                if show_debug:
-                    st.warning(f"⚠️ {target}: Approach 2 also failed: {str(e2)[:200]}")
-                
-                # Approach 3: Try with date filters in where clause (least likely to work)
-                try:
-                    if show_debug:
-                        st.info(f"🔄 {target}: Trying Approach 3 (history + date filters in where)")
-                    where_obj_with_date = {"and":[
-                        {"field":"last_seen","is":"is_null"},
-                        {"field":"first_seen_link","is":["gte",start_iso]},
-                        {"field":"first_seen_link","is":["lte",end_iso]}
-                    ]}
-                    rows = self._paginate(self.EP_BACKLINKS, {
-                        "target": f"{target}/",
-                        "mode": "subdomains",
-                        "limit": 50000,
-                        "history": f"since:{start_iso[:10]}",
-                        "order_by": "ahrefs_rank_source:asc",
-                        "aggregation": "1_per_domain",
-                        "protocol":"both",
-                        "select": "url_from,first_seen_link",  # Minimal fields
-                        "where": json.dumps(where_obj_with_date),
-                    })
-                    if show_debug:
-                        st.success(f"✅ {target}: Approach 3 succeeded - got {len(rows)} rows from API")
-                except Exception as e3:
-                    error_msg = str(e3)
-                    if show_debug:
-                        st.error(f"❌ {target}: All approaches failed. Last error: {str(e3)[:200]}")
-        
-        # Process the rows we got (if any)
-        try:
             if show_debug:
-                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API (history since {start_iso[:10]})")
-                if len(rows) == 0:
-                    st.warning(f"⚠️ {target}: API returned 0 backlinks. This could mean:")
-                    st.write(f"   • No new backlinks in the last {days} days")
-                    st.write(f"   • Date range might be incorrect")
-                    st.write(f"   • API endpoint might not support this query format")
-                elif rows:
-                    # Show sample dates to debug
-                    sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
-                    st.write(f"   Sample first_seen dates: {sample_dates}")
-            
-            # Filter by date client-side to ensure we only get backlinks in the specified date range
-            # The history parameter might return all backlinks since that date, not just the last N days
-            if rows:
-                filtered_rows = []
-                missing_date_count = 0
-                out_of_range_count = 0
-                date_parse_errors = 0
-                
-                # Parse the date range once
-                try:
-                    start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                    end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                except Exception as e:
-                    if show_debug:
-                        st.error(f"❌ {target}: Error parsing date range: {str(e)}")
-                    start_dt = None
-                    end_dt = None
-                
-                for r in rows:
-                    fs = r.get("first_seen_link")
-                    if not fs:
-                        missing_date_count += 1
-                        continue
-                    
-                    # Parse and check if date is in range
-                    try:
-                        fs_str = fs.replace("Z", "+00:00")
-                        fs_dt = datetime.fromisoformat(fs_str)
-                        
-                        # Only include if date is within our range
-                        if start_dt and end_dt:
-                            if start_dt <= fs_dt <= end_dt:
-                                filtered_rows.append(r)
-                            else:
-                                out_of_range_count += 1
-                        else:
-                            # If date parsing failed, include it (better to include than exclude)
-                            filtered_rows.append(r)
-                    except Exception as parse_err:
-                        date_parse_errors += 1
-                        # If date parsing fails, exclude it to be safe
-                        if show_debug and date_parse_errors <= 3:
-                            st.write(f"⚠️ Could not parse date '{fs}': {str(parse_err)[:50]}")
-                
-                rows = filtered_rows
-                if show_debug:
-                    st.info(f"📅 {target}: After date filtering ({start_iso[:10]} to {end_iso[:10]}):")
-                    st.write(f"   • Included: {len(rows)} backlinks")
-                    st.write(f"   • Excluded (out of range): {out_of_range_count}")
-                    st.write(f"   • Excluded (missing date): {missing_date_count}")
-                    st.write(f"   • Date parse errors: {date_parse_errors}")
-                    if len(rows) > 0:
-                        # Show sample dates to verify they're in the right range
-                        sample_dates = [r.get("first_seen_link", "N/A")[:10] for r in rows[:5]]
-                        st.write(f"   Sample first_seen dates: {sample_dates}")
+                st.info(f"📊 {target}: Fetched {len(rows)} total backlinks from API")
             
             # Filter backlinks to only include those from qualifying domains (if filtering is enabled)
             out = []
@@ -658,16 +534,7 @@ class AhrefsClient:
                     # Only include if domain is in our qualifying set (or include all if filtering failed)
                     if not use_quality_filter or (reg and reg in qualifying_domains):
                         fs = r.get("first_seen_link")
-                        # Try to extract DR and Traffic from backlink data if available
-                        dr = r.get("domain_rating") or r.get("dr")
-                        traffic = r.get("traffic") or r.get("organic_traffic")
-                        out.append({
-                            "source_url": uf, 
-                            "first_seen": fs, 
-                            "dr": int(dr) if isinstance(dr, (int, float)) and dr > 0 else None,
-                            "traffic": int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None,
-                            "raw": r
-                        })
+                        out.append({"source_url": uf, "first_seen": fs, "raw": r})
             
             if show_debug:
                 if use_quality_filter and qualifying_domains:
@@ -678,7 +545,7 @@ class AhrefsClient:
             return out
         except Exception as e:
             if show_debug:
-                st.error(f"❌ {target}: Error processing backlinks - {str(e)[:200]}")
+                st.error(f"❌ {target}: Error fetching backlinks - {str(e)[:200]}")
             return []
 
 # ---------------- cache ----------------
@@ -758,7 +625,7 @@ with st.sidebar:
     days = st.number_input("Window (days)", min_value=1, max_value=60, value=14)
     gambling_domain = st.text_input("Gambling.com domain", value=DEFAULT_GAMBLING)
     max_concurrency = st.slider("Ahrefs concurrency", 2, 20, 8)
-    show_debug = st.checkbox("Show debug output", value=True)  # Default to True to help debug "0 new" issue
+    show_debug = st.checkbox("Show debug counts", value=False)
     
     st.divider()
     st.subheader("Exclude Domains From Databases")
@@ -989,23 +856,13 @@ def run_pipeline(force_refresh_cache: bool = False):
     
     if competitors:
         prog = st.progress(0.0); done=0
-        debug_summary = []  # Collect debug info to show at the end
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
             for fut in as_completed([pool.submit(fetch_comp, c) for c in competitors]):
                 res = fut.result() or []
-                comp_name = None
-                row_count = 0
                 for r in res:
-                    if "_debug" in r:
-                        comp_name = r["_debug"].split(":")[0] if ":" in r["_debug"] else "Unknown"
-                        row_count = int(r["_debug"].split()[-2]) if len(r["_debug"].split()) >= 2 else 0
-                        if show_debug:
-                            st.write(r["_debug"])
-                        debug_summary.append((comp_name, row_count, "success"))
+                    if "_debug" in r and show_debug: st.write(r["_debug"])
                     elif "_error" in r: 
-                        comp_name = r["_error"].split(":")[0] if ":" in r["_error"] else "Unknown"
                         st.error(r["_error"])
-                        debug_summary.append((comp_name, 0, f"error: {r['_error'][:50]}"))
                         if "API limit reached" in r["_error"]:
                             api_limit_hit = True
                     elif "_api_limit" in r:
@@ -1018,173 +875,97 @@ def run_pipeline(force_refresh_cache: bool = False):
                                 "linking_domain": reg,
                                 "source_url": src,
                                 "first_seen": r.get("first_seen"),
-                                "dr": r.get("dr"),  # DR from backlink data if available
-                                "traffic": r.get("traffic"),  # Traffic from backlink data if available
                             })
                 done += 1; prog.progress(done/len(competitors))
-        
-        # Show summary of what happened
-        if debug_summary:
-            st.write("---")
-            st.write("### 📊 Summary of API calls:")
-            total_backlinks = 0
-            for comp, count, status in debug_summary:
-                total_backlinks += count
-                if "error" in status:
-                    st.write(f"❌ **{comp}**: {status}")
-                elif count == 0:
-                    st.write(f"⚠️ **{comp}**: {count} backlinks (API returned 0 results - check debug output above for details)")
-                else:
-                    st.write(f"✅ **{comp}**: {count} backlinks")
-            st.write(f"**Total backlinks fetched**: {total_backlinks}")
-            if total_backlinks == 0:
-                st.warning("⚠️ **No backlinks were fetched from the API.** This could mean:")
-                st.write("1. No new backlinks exist in the specified date range")
-                st.write("2. The API endpoint or parameters are incorrect")
-                st.write("3. The date range calculation is wrong")
-                st.write("4. Check the debug output above for specific error messages")
 
     # Show API limit warning if hit
     if api_limit_hit:
         st.warning("⚠️ Ahrefs API limit reached for some competitors. Results may be incomplete. Consider reducing concurrency or checking your API subscription.")
 
-    # 5) Enrich results with DR and Traffic data
+    # 5) Enrich with DR and Traffic data
     if output_records:
-        # Check which domains need DR/Traffic (those that don't already have it from backlinks)
+        st.write("## 5) Fetching DR and Traffic data for linking domains…")
         unique_domains = sorted(set(r["linking_domain"] for r in output_records))
-        domains_with_metrics = {r["linking_domain"] for r in output_records if r.get("dr") is not None or r.get("traffic") is not None}
-        domains_needing_metrics = [d for d in unique_domains if d not in domains_with_metrics]
+        st.info(f"📊 Fetching DR and Traffic for {len(unique_domains)} unique linking domains...")
         
-        # Fetch DR/Traffic data for domains that don't have it yet
-        if domains_needing_metrics:
-            st.write("## 5) Fetching DR and Traffic data for linking domains...")
-            st.info(f"ℹ️ {len(domains_with_metrics)} domains already have metrics from backlinks. Fetching for {len(domains_needing_metrics)} remaining domains.")
-            if len(domains_needing_metrics) > 100:
-                st.warning(f"⚠️ Fetching DR/Traffic for {len(domains_needing_metrics)} domains may take several minutes and use significant API credits.")
-                st.info("💡 Tip: This step can be skipped if you only need domain lists, but DR/Traffic helps identify high-quality opportunities.")
-                fetch_metrics = st.checkbox("Fetch DR and Traffic data", value=True, key="fetch_metrics")
-            else:
-                fetch_metrics = True  # Auto-fetch for smaller sets
-            
-            domain_metrics = {}
-            if fetch_metrics and domains_needing_metrics:
-                st.info(f"📊 Fetching DR/Traffic for {len(domains_needing_metrics)} domains...")
+        def fetch_domain_metrics(domain: str) -> Dict[str, Optional[int]]:
+            """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
+            try:
+                # Use /refdomains endpoint - query the domain itself to get its metrics
+                params = {
+                    "target": f"{domain}/",
+                    "mode": "domain",
+                    "limit": 1,
+                    "select": "domain,domain_rating,traffic",
+                }
+                result = ah._get(ah.EP_REFDOMAINS, params)
                 
-                # Create a method to fetch DR/Traffic for a domain
-                def fetch_domain_metrics(domain: str) -> Tuple[Optional[int], Optional[int]]:
-                    """Fetch DR and Traffic for a single domain - try multiple approaches"""
-                    # Method 1: Try /refdomains endpoint with domain as target
-                    # This returns referring domains, but we can check if the domain itself is in results
-                    try:
-                        params = {
-                            "target": f"{domain}/",
-                            "mode": "domain",
-                            "limit": 100,  # Get more results to find our domain
-                            "select": "domain,domain_rating,traffic",
-                        }
-                        result = ah._get(ah.EP_REFDOMAINS, params)
-                        
-                        # NOTE: /refdomains returns domains that link TO the target, not the target's own metrics
-                        # However, the response might contain target domain info in metadata
-                        # Check response metadata first
-                        if isinstance(result, dict):
-                            # Some APIs include target domain metrics in response metadata
-                            metadata = result.get("meta") or result.get("target") or {}
-                            target_dr = (metadata.get("domain_rating") or metadata.get("dr") or 
-                                       result.get("target_domain_rating") or result.get("domain_rating"))
-                            target_traffic = (metadata.get("traffic") or metadata.get("organic_traffic") or 
-                                            result.get("target_traffic") or result.get("traffic"))
-                            if target_dr or target_traffic:
-                                dr_val = int(target_dr) if isinstance(target_dr, (int, float)) and target_dr > 0 else None
-                                traffic_val = int(target_traffic) if isinstance(target_traffic, (int, float)) and target_traffic > 0 else None
-                                if dr_val is not None or traffic_val is not None:
-                                    return (dr_val, traffic_val)
-                        
-                        # Parse response structure
-                        rows = []
-                        if "referring_domains" in result:
-                            rows = result["referring_domains"]
-                        elif "data" in result:
-                            if isinstance(result["data"], list):
-                                rows = result["data"]
-                            elif "rows" in result["data"]:
-                                rows = result["data"]["rows"]
-                        elif "rows" in result:
-                            rows = result["rows"]
-                        elif isinstance(result, list):
-                            rows = result
-                        elif isinstance(result, dict) and ("domain" in result or "domain_rating" in result):
-                            rows = [result]
-                        
-                        # The /refdomains endpoint returns domains that link TO our target
-                        # We need to find if our domain appears in the results with its own metrics
-                        # This is unlikely, but check anyway
-                        for r in rows:
-                            if not isinstance(r, dict):
-                                continue
-                            row_domain = r.get("domain") or r.get("referring_domain") or r.get("host")
-                            if row_domain:
-                                reg = extract_registrable_domain(row_domain)
-                                if reg == domain:
-                                    dr = r.get("domain_rating") or r.get("dr")
-                                    traffic = r.get("traffic") or r.get("organic_traffic")
-                                    dr_val = int(dr) if isinstance(dr, (int, float)) and dr > 0 else None
-                                    traffic_val = int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None
-                                    if dr_val is not None or traffic_val is not None:
-                                        return (dr_val, traffic_val)
-                        
-                    except requests.HTTPError as e:
-                        # Endpoint might not support this query format
-                        pass
-                    except Exception:
-                        pass
+                # Parse response - check if target domain metrics are in metadata or response
+                dr = None
+                traffic = None
+                
+                # Check metadata/target fields first
+                if isinstance(result, dict):
+                    meta = result.get("meta") or result.get("target") or {}
+                    dr = meta.get("domain_rating") or meta.get("dr") or result.get("domain_rating") or result.get("dr")
+                    traffic = meta.get("traffic") or meta.get("organic_traffic") or result.get("traffic") or result.get("organic_traffic")
+                
+                # If not in metadata, check rows (though /refdomains returns referring domains, not target)
+                if dr is None or traffic is None:
+                    rows = []
+                    if "referring_domains" in result:
+                        rows = result["referring_domains"]
+                    elif "data" in result:
+                        if isinstance(result["data"], list):
+                            rows = result["data"]
+                        elif "rows" in result["data"]:
+                            rows = result["data"]["rows"]
+                    elif "rows" in result:
+                        rows = result["rows"]
                     
-                    # /refdomains endpoint doesn't return target domain's own metrics
-                    # We would need a domain-info or metrics endpoint for this
-                    # For now, return None - metrics cannot be fetched with current endpoint
-                    return None, None
+                    # Look for the domain in results (unlikely but check)
+                    for r in rows:
+                        if isinstance(r, dict):
+                            row_domain = r.get("domain") or r.get("referring_domain")
+                            if row_domain and extract_registrable_domain(row_domain) == domain:
+                                dr = r.get("domain_rating") or r.get("dr") or dr
+                                traffic = r.get("traffic") or r.get("organic_traffic") or traffic
+                                break
                 
-                # Fetch DR/Traffic only for domains that need it (with progress and higher concurrency)
-                prog_metrics = st.progress(0.0)
-                status_text = st.empty()
-                with ThreadPoolExecutor(max_workers=min(20, len(domains_needing_metrics))) as pool:
-                    futures = {pool.submit(fetch_domain_metrics, d): d for d in domains_needing_metrics}
-                    done = 0
-                    success_count = 0
-                    for fut in as_completed(futures):
-                        domain = futures[fut]
-                        dr, traffic = fut.result()
-                        domain_metrics[domain] = {"dr": dr, "traffic": traffic}
-                        if dr is not None or traffic is not None:
-                            success_count += 1
-                        done += 1
-                        progress = done / len(domains_needing_metrics)
-                        prog_metrics.progress(progress)
-                        if done % 50 == 0 or done == len(domains_needing_metrics):
-                            status_text.text(f"📊 Progress: {done}/{len(domains_needing_metrics)} domains ({int(progress*100)}%) - {success_count} with metrics")
-                
-                # Add DR and Traffic to output records
-                for record in output_records:
-                    domain = record["linking_domain"]
-                    metrics = domain_metrics.get(domain, {})
-                    record["dr"] = metrics.get("dr")
-                    record["traffic"] = metrics.get("traffic")
-                
-                fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
-                total_with_metrics = len(domains_with_metrics) + fetched_count
-                if fetched_count > 0:
-                    st.success(f"✅ Fetched DR/Traffic data for {fetched_count}/{len(domains_needing_metrics)} domains. Total: {total_with_metrics}/{len(unique_domains)} domains have metrics.")
-                elif len(domains_with_metrics) > 0:
-                    st.info(f"ℹ️ {len(domains_with_metrics)} domains have metrics from backlinks. Could not fetch additional metrics - `/refdomains` endpoint may not support individual domain queries.")
-                else:
-                    st.warning(f"⚠️ Could not fetch DR/Traffic for any domains. The `/refdomains` endpoint may not support querying individual domain metrics. Consider checking Ahrefs API documentation for the correct endpoint.")
+                return {
+                    "dr": int(dr) if isinstance(dr, (int, float)) and dr > 0 else None,
+                    "traffic": int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None
+                }
+            except Exception as e:
+                # If fetch fails, return None values
+                return {"dr": None, "traffic": None}
+        
+        # Fetch metrics for all unique domains (with progress)
+        domain_metrics = {}
+        if len(unique_domains) > 0:
+            prog_metrics = st.progress(0.0)
+            with ThreadPoolExecutor(max_workers=min(10, len(unique_domains))) as pool:
+                futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
+                done = 0
+                for fut in as_completed(futures):
+                    domain = futures[fut]
+                    domain_metrics[domain] = fut.result()
+                    done += 1
+                    prog_metrics.progress(done / len(unique_domains))
+            
+            # Add DR and Traffic to output records
+            for record in output_records:
+                domain = record["linking_domain"]
+                metrics = domain_metrics.get(domain, {})
+                record["dr"] = metrics.get("dr")
+                record["traffic"] = metrics.get("traffic")
+            
+            fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
+            if fetched_count > 0:
+                st.success(f"✅ Fetched DR/Traffic for {fetched_count}/{len(unique_domains)} domains")
             else:
-                # Add empty DR/Traffic columns if user skipped
-                for record in output_records:
-                    record["dr"] = None
-                    record["traffic"] = None
-                st.info("ℹ️ Skipped DR/Traffic fetching. Results will show without these metrics.")
-
+                st.warning("⚠️ Could not fetch DR/Traffic data. The API endpoint may not support individual domain queries.")
+    
     # 6) Results
     st.write("## 6) Final results — exclusive domains")
     if not output_records:
