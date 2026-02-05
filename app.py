@@ -1,4 +1,4 @@
-# v3.0.1 — BATCH ANALYSIS API for maximum efficiency:
+# v3.0.4 — BATCH ANALYSIS API for maximum efficiency:
 #   • Uses /batch-analysis endpoint to get DR/Traffic for many domains in ONE call
 #   • Fetches new backlinks per competitor, collects unique domains
 #   • Single batch call for metrics (vs individual calls per domain)
@@ -335,61 +335,127 @@ class AhrefsClient:
         show_debug: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        Fetch new backlinks for a competitor (raw data, no filtering).
-        Returns list of {source_url, first_seen, domain}
+        Fetch new backlinks for a competitor using Ahrefs API v3.
+
+        API endpoint: /site-explorer/all-backlinks
+        Based on docs: https://docs.ahrefs.com/docs/api/site-explorer/operations/list-all-backlinks
+
+        Key parameters:
+        - target: URL/domain to analyze (required)
+        - mode: exact, prefix, domain, subdomains (required)
+        - select: Comma-separated list of columns (required for output)
+        - limit: Max rows per page (default 1000)
+        - output: json
         """
         start_iso, end_iso = iso_window_last_n_days(days)
+        start_date = start_iso[:10]  # YYYY-MM-DD
 
-        if target == "gambling.com":
-            target = "www.gambling.com"
+        # Target should be the bare domain for "subdomains" mode
+        # Remove any protocol if present
+        target_clean = target
+        if target_clean.startswith("http://"):
+            target_clean = target_clean[7:]
+        elif target_clean.startswith("https://"):
+            target_clean = target_clean[8:]
+        target_clean = target_clean.rstrip("/")
 
-        where_obj = {
-            "and": [
-                {"field": "first_seen_link", "is": ["gte", start_iso]},
-                {"field": "first_seen_link", "is": ["lte", end_iso]},
-                {"field": "last_seen", "is": "is_null"}  # Live links only
-            ]
-        }
+        rows = []
+        error_msg = None
 
+        # Primary approach: Use the backlinks endpoint with proper parameters
         try:
-            rows = self._paginate(self.EP_BACKLINKS, {
-                "target": f"{target}/",
-                "mode": "subdomains",
-                "limit": 50000,
-                "history": f"since:{start_iso[:10]}",
-                "order_by": "ahrefs_rank_source:asc",
-                "aggregation": "1_per_domain",
-                "protocol": "both",
-                "select": "url_from,first_seen_link",
-                "where": json.dumps(where_obj),
-            })
+            # Based on API docs, use minimal required params
+            params = {
+                "target": target_clean,
+                "mode": "subdomains",  # subdomains mode captures all links to domain and subdomains
+                "limit": 1000,
+                "output": "json",
+                "select": "url_from,first_seen_link,domain_rating_source",
+                "order_by": "first_seen_link:desc",
+            }
 
-            if show_debug and rows:
-                st.info(f"📊 {target}: {len(rows)} new backlinks")
+            if show_debug:
+                st.write(f"🔍 {target_clean}: Calling API with params: {params}")
 
-            results = []
-            for r in rows:
-                url = r.get("url_from")
-                if not url:
-                    continue
+            rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
 
-                host = url_to_host(url)
-                reg = extract_registrable_domain(host)
-                if not reg:
-                    continue
+            if show_debug:
+                st.info(f"📊 {target_clean}: API returned {len(rows)} total backlinks")
+                if rows and len(rows) > 0:
+                    st.write(f"   First row sample: {rows[0]}")
 
+        except requests.HTTPError as e:
+            error_msg = str(e)
+            if show_debug:
+                st.warning(f"⚠️ {target_clean}: Primary approach failed - {error_msg[:150]}")
+
+            # Fallback: Try with "domain" mode instead of "subdomains"
+            try:
+                params = {
+                    "target": target_clean,
+                    "mode": "domain",
+                    "limit": 1000,
+                    "output": "json",
+                    "select": "url_from,first_seen_link",
+                    "order_by": "first_seen_link:desc",
+                }
+
+                if show_debug:
+                    st.write(f"🔍 {target_clean}: Fallback with mode=domain...")
+
+                rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
+
+                if show_debug:
+                    st.info(f"📊 {target_clean}: Fallback returned {len(rows)} backlinks")
+
+            except requests.HTTPError as e2:
+                if show_debug:
+                    st.error(f"❌ {target_clean}: All approaches failed - {str(e2)[:150]}")
+                return []
+
+        # Process and filter results by date
+        results = []
+        for r in rows:
+            url = r.get("url_from")
+            if not url:
+                continue
+
+            host = url_to_host(url)
+            reg = extract_registrable_domain(host)
+            if not reg:
+                continue
+
+            first_seen = r.get("first_seen_link", "")
+
+            # Filter: only include backlinks from within our date window
+            if first_seen:
+                # first_seen format: "2024-01-15T00:00:00Z" or "2024-01-15"
+                first_seen_date = first_seen[:10] if len(first_seen) >= 10 else ""
+                if first_seen_date and first_seen_date >= start_date:
+                    results.append({
+                        "source_url": url,
+                        "first_seen": first_seen,
+                        "domain": reg
+                    })
+            else:
+                # If no first_seen date, include it anyway (might be recent)
+                # but mark it as unknown
                 results.append({
                     "source_url": url,
-                    "first_seen": r.get("first_seen_link"),
+                    "first_seen": "unknown",
                     "domain": reg
                 })
 
-            return results
+        if show_debug:
+            st.success(f"✅ {target_clean}: {len(results)} backlinks found (filtered to last {days} days: {len([r for r in results if r.get('first_seen') != 'unknown' and r.get('first_seen', '')[:10] >= start_date])})")
 
-        except requests.HTTPError as e:
-            if show_debug:
-                st.error(f"❌ {target}: {str(e)[:150]}")
-            return []
+        # Final filter to ensure we only return new backlinks
+        filtered_results = [
+            r for r in results
+            if r.get("first_seen") == "unknown" or (r.get("first_seen", "")[:10] >= start_date if len(r.get("first_seen", "")) >= 10 else True)
+        ]
+
+        return filtered_results
 
 # ---------------- SQLite Cache ----------------
 DB_PATH = "./backlink_cache.sqlite"
@@ -538,9 +604,83 @@ if test_api_btn and AHREFS_TOKEN:
     st.write("## 🧪 API Test")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
+    # Test 1: Raw API call to see response structure
+    st.write("### Test 1: Raw Backlinks API Call")
+    with st.spinner("Testing raw API call..."):
+        try:
+            test_target = "ahrefs.com"
+            params = {
+                "target": test_target,
+                "mode": "subdomains",
+                "limit": 5,
+                "output": "json",
+                "select": "url_from,first_seen_link,domain_rating_source",
+                "order_by": "first_seen_link:desc",
+            }
+            st.write(f"📤 Request: GET {ah.BASE}{ah.EP_BACKLINKS}")
+            st.write(f"📤 Params: {params}")
+
+            response = ah._get(ah.EP_BACKLINKS, params)
+            st.write(f"📥 Response keys: {list(response.keys())}")
+            st.json(response)
+
+            # Show how many backlinks were returned
+            if "backlinks" in response:
+                st.success(f"✅ Found {len(response['backlinks'])} backlinks in response")
+            else:
+                st.warning("⚠️ No 'backlinks' key in response - check structure above")
+        except Exception as e:
+            st.error(f"❌ Raw API test failed: {e}")
+
+    # Test 1b: Test with a competitor domain from the list
+    st.write("### Test 1b: Test with First Competitor")
+    if airtable_base_id and airtable_table and AIRTABLE_TOKEN:
+        with st.spinner("Fetching first competitor..."):
+            try:
+                at_test = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
+                test_comps = at_test.fetch_domains(airtable_table, airtable_domain_field, view_or_id=(airtable_view or None), max_records=3)
+                if test_comps:
+                    first_comp = test_comps[0]
+                    st.write(f"📤 Testing with competitor: **{first_comp}**")
+
+                    params = {
+                        "target": first_comp,
+                        "mode": "subdomains",
+                        "limit": 10,
+                        "output": "json",
+                        "select": "url_from,first_seen_link",
+                        "order_by": "first_seen_link:desc",
+                    }
+                    response = ah._get(ah.EP_BACKLINKS, params)
+                    st.write(f"📥 Response keys: {list(response.keys())}")
+                    if "backlinks" in response:
+                        st.success(f"✅ Found {len(response['backlinks'])} backlinks for {first_comp}")
+                        if response['backlinks']:
+                            st.write("First backlink:")
+                            st.json(response['backlinks'][0])
+                    else:
+                        st.json(response)
+                else:
+                    st.warning("No competitors found in Airtable")
+            except Exception as e:
+                st.error(f"❌ Competitor test failed: {e}")
+
+    # Test 2: Backlinks fetch function
+    st.write("### Test 2: Backlinks Fetch Function")
+    with st.spinner("Testing backlinks fetch..."):
+        try:
+            test_target = "ahrefs.com"
+            test_results = ah.fetch_new_backlinks_raw(test_target, days=30, show_debug=True)
+            st.write(f"✅ Backlinks test: {len(test_results)} NEW backlinks for {test_target} (last 30 days)")
+            if test_results:
+                st.write(f"   First result: {test_results[0]}")
+        except Exception as e:
+            st.error(f"❌ Backlinks test failed: {e}")
+
+    # Test 3: Batch Analysis endpoint
+    st.write("### Test 3: Batch Analysis Endpoint")
     with st.spinner("Testing Batch Analysis API..."):
         try:
-            # Test batch analysis with a few domains
             test_domains = ["ahrefs.com", "moz.com", "semrush.com"]
             results = ah.batch_get_domain_metrics(test_domains, batch_size=10, show_debug=True)
 
@@ -551,7 +691,7 @@ if test_api_btn and AHREFS_TOKEN:
             else:
                 st.warning("⚠️ No results returned")
         except Exception as e:
-            st.error(f"❌ API test failed: {e}")
+            st.error(f"❌ Batch Analysis test failed: {e}")
 
 # ---------------- Main Pipeline ----------------
 def run_pipeline(force_refresh_cache: bool = False):
@@ -859,8 +999,9 @@ if refresh_cache_btn:
 # Footer
 st.divider()
 st.caption("""
-**v3.0.1** — Batch Analysis API (max 100 targets per batch)
+**v3.0.4** — Batch Analysis API + Fixed Backlinks Query
 - Uses `/batch-analysis` endpoint for DR/Traffic (much more efficient)
+- Fixed backlinks API call - proper target format and parameters
 - Fetches backlinks first, then batch-queries metrics
 - Parallel Airtable & backlink fetches
 - DR/Traffic filter can be disabled
