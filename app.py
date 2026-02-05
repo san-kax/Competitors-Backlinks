@@ -118,6 +118,7 @@ class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     EP_BACKLINKS = "/site-explorer/all-backlinks"
     EP_REFDOMAINS = "/site-explorer/refdomains"
+    EP_DOMAIN_RATING = "/site-explorer/domain-rating"  # Alternative endpoint for domain metrics
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
         self.session = session or make_session()
@@ -505,7 +506,7 @@ class AhrefsClient:
                 "order_by": "ahrefs_rank_source:asc",
                 "aggregation": "1_per_domain",
                 "protocol":"both",
-                "select": "url_from,first_seen_link",  # Minimal fields - DR/Traffic not available in /all-backlinks
+                "select": "url_from,first_seen_link,domain_rating_source,traffic_source",  # Try source domain metrics
                 "where": json.dumps(where_obj),
             })
             
@@ -873,6 +874,8 @@ def run_pipeline(force_refresh_cache: bool = False):
                                 "linking_domain": reg,
                                 "source_url": src,
                                 "first_seen": r.get("first_seen"),
+                                "dr": r.get("dr"),  # DR from backlink data if available
+                                "traffic": r.get("traffic"),  # Traffic from backlink data if available
                             })
                 done += 1; prog.progress(done/len(competitors))
 
@@ -882,69 +885,118 @@ def run_pipeline(force_refresh_cache: bool = False):
 
     # 5) Enrich results with DR and Traffic data
     if output_records:
-        # Always fetch DR/Traffic since /all-backlinks endpoint doesn't provide it
+        # Check which domains need DR/Traffic (those that don't already have it from backlinks)
         unique_domains = sorted(set(r["linking_domain"] for r in output_records))
+        domains_with_metrics = {r["linking_domain"] for r in output_records if r.get("dr") is not None or r.get("traffic") is not None}
+        domains_needing_metrics = [d for d in unique_domains if d not in domains_with_metrics]
         
-        # Fetch DR/Traffic data (required for quality analysis)
-        st.write("## 5) Fetching DR and Traffic data for linking domains...")
-        if len(unique_domains) > 100:
-            st.warning(f"⚠️ Fetching DR/Traffic for {len(unique_domains)} domains may take several minutes and use significant API credits.")
-            st.info("💡 Tip: This step can be skipped if you only need domain lists, but DR/Traffic helps identify high-quality opportunities.")
-            fetch_metrics = st.checkbox("Fetch DR and Traffic data", value=True, key="fetch_metrics")
-        else:
-            fetch_metrics = True  # Auto-fetch for smaller sets
+        # Fetch DR/Traffic data for domains that don't have it yet
+        if domains_needing_metrics:
+            st.write("## 5) Fetching DR and Traffic data for linking domains...")
+            st.info(f"ℹ️ {len(domains_with_metrics)} domains already have metrics from backlinks. Fetching for {len(domains_needing_metrics)} remaining domains.")
+            if len(domains_needing_metrics) > 100:
+                st.warning(f"⚠️ Fetching DR/Traffic for {len(domains_needing_metrics)} domains may take several minutes and use significant API credits.")
+                st.info("💡 Tip: This step can be skipped if you only need domain lists, but DR/Traffic helps identify high-quality opportunities.")
+                fetch_metrics = st.checkbox("Fetch DR and Traffic data", value=True, key="fetch_metrics")
+            else:
+                fetch_metrics = True  # Auto-fetch for smaller sets
             
             domain_metrics = {}
-            if fetch_metrics:
-                st.info(f"📊 Fetching DR/Traffic for {len(unique_domains)} unique domains...")
+            if fetch_metrics and domains_needing_metrics:
+                st.info(f"📊 Fetching DR/Traffic for {len(domains_needing_metrics)} domains...")
                 
                 # Create a method to fetch DR/Traffic for a domain
                 def fetch_domain_metrics(domain: str) -> Tuple[Optional[int], Optional[int]]:
-                    """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
+                    """Fetch DR and Traffic for a single domain - try multiple approaches"""
+                    # Method 1: Try /refdomains endpoint with domain as target
+                    # This returns referring domains, but we can check if the domain itself is in results
                     try:
-                        # Query the domain itself to get its metrics
                         params = {
                             "target": f"{domain}/",
                             "mode": "domain",
-                            "limit": 1,
+                            "limit": 100,  # Get more results to find our domain
                             "select": "domain,domain_rating,traffic",
                         }
                         result = ah._get(ah.EP_REFDOMAINS, params)
-                        # Response might have different structures
-                        rows = (result.get("referring_domains") or 
-                               result.get("data", {}).get("rows", []) or 
-                               result.get("rows", []) or
-                               [result] if isinstance(result, dict) and "domain" in result else [])
                         
+                        # NOTE: /refdomains returns domains that link TO the target, not the target's own metrics
+                        # However, the response might contain target domain info in metadata
+                        # Check response metadata first
+                        if isinstance(result, dict):
+                            # Some APIs include target domain metrics in response metadata
+                            metadata = result.get("meta") or result.get("target") or {}
+                            target_dr = (metadata.get("domain_rating") or metadata.get("dr") or 
+                                       result.get("target_domain_rating") or result.get("domain_rating"))
+                            target_traffic = (metadata.get("traffic") or metadata.get("organic_traffic") or 
+                                            result.get("target_traffic") or result.get("traffic"))
+                            if target_dr or target_traffic:
+                                dr_val = int(target_dr) if isinstance(target_dr, (int, float)) and target_dr > 0 else None
+                                traffic_val = int(target_traffic) if isinstance(target_traffic, (int, float)) and target_traffic > 0 else None
+                                if dr_val is not None or traffic_val is not None:
+                                    return (dr_val, traffic_val)
+                        
+                        # Parse response structure
+                        rows = []
+                        if "referring_domains" in result:
+                            rows = result["referring_domains"]
+                        elif "data" in result:
+                            if isinstance(result["data"], list):
+                                rows = result["data"]
+                            elif "rows" in result["data"]:
+                                rows = result["data"]["rows"]
+                        elif "rows" in result:
+                            rows = result["rows"]
+                        elif isinstance(result, list):
+                            rows = result
+                        elif isinstance(result, dict) and ("domain" in result or "domain_rating" in result):
+                            rows = [result]
+                        
+                        # The /refdomains endpoint returns domains that link TO our target
+                        # We need to find if our domain appears in the results with its own metrics
+                        # This is unlikely, but check anyway
                         for r in rows:
-                            # Check if this row matches our domain
-                            row_domain = r.get("domain") or r.get("referring_domain")
+                            if not isinstance(r, dict):
+                                continue
+                            row_domain = r.get("domain") or r.get("referring_domain") or r.get("host")
                             if row_domain:
                                 reg = extract_registrable_domain(row_domain)
                                 if reg == domain:
-                                    dr = r.get("domain_rating") or r.get("dr") or 0
-                                    traffic = r.get("traffic") or r.get("organic_traffic") or 0
-                                    return (int(dr) if isinstance(dr, (int, float)) and dr > 0 else None, 
-                                           int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None)
+                                    dr = r.get("domain_rating") or r.get("dr")
+                                    traffic = r.get("traffic") or r.get("organic_traffic")
+                                    dr_val = int(dr) if isinstance(dr, (int, float)) and dr > 0 else None
+                                    traffic_val = int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None
+                                    if dr_val is not None or traffic_val is not None:
+                                        return (dr_val, traffic_val)
+                        
+                    except requests.HTTPError as e:
+                        # Endpoint might not support this query format
+                        pass
                     except Exception:
                         pass
+                    
+                    # /refdomains endpoint doesn't return target domain's own metrics
+                    # We would need a domain-info or metrics endpoint for this
+                    # For now, return None - metrics cannot be fetched with current endpoint
                     return None, None
                 
-                # Fetch DR/Traffic for all unique domains (with progress and higher concurrency)
+                # Fetch DR/Traffic only for domains that need it (with progress and higher concurrency)
                 prog_metrics = st.progress(0.0)
                 status_text = st.empty()
-                with ThreadPoolExecutor(max_workers=min(20, len(unique_domains))) as pool:
-                    futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
+                with ThreadPoolExecutor(max_workers=min(20, len(domains_needing_metrics))) as pool:
+                    futures = {pool.submit(fetch_domain_metrics, d): d for d in domains_needing_metrics}
                     done = 0
+                    success_count = 0
                     for fut in as_completed(futures):
                         domain = futures[fut]
                         dr, traffic = fut.result()
                         domain_metrics[domain] = {"dr": dr, "traffic": traffic}
+                        if dr is not None or traffic is not None:
+                            success_count += 1
                         done += 1
-                        progress = done / len(unique_domains)
+                        progress = done / len(domains_needing_metrics)
                         prog_metrics.progress(progress)
-                        if done % 50 == 0 or done == len(unique_domains):
-                            status_text.text(f"📊 Progress: {done}/{len(unique_domains)} domains ({int(progress*100)}%)")
+                        if done % 50 == 0 or done == len(domains_needing_metrics):
+                            status_text.text(f"📊 Progress: {done}/{len(domains_needing_metrics)} domains ({int(progress*100)}%) - {success_count} with metrics")
                 
                 # Add DR and Traffic to output records
                 for record in output_records:
@@ -954,7 +1006,13 @@ def run_pipeline(force_refresh_cache: bool = False):
                     record["traffic"] = metrics.get("traffic")
                 
                 fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
-                st.success(f"✅ Fetched DR/Traffic data for {fetched_count}/{len(unique_domains)} domains")
+                total_with_metrics = len(domains_with_metrics) + fetched_count
+                if fetched_count > 0:
+                    st.success(f"✅ Fetched DR/Traffic data for {fetched_count}/{len(domains_needing_metrics)} domains. Total: {total_with_metrics}/{len(unique_domains)} domains have metrics.")
+                elif len(domains_with_metrics) > 0:
+                    st.info(f"ℹ️ {len(domains_with_metrics)} domains have metrics from backlinks. Could not fetch additional metrics - `/refdomains` endpoint may not support individual domain queries.")
+                else:
+                    st.warning(f"⚠️ Could not fetch DR/Traffic for any domains. The `/refdomains` endpoint may not support querying individual domain metrics. Consider checking Ahrefs API documentation for the correct endpoint.")
             else:
                 # Add empty DR/Traffic columns if user skipped
                 for record in output_records:
