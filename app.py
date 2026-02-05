@@ -530,17 +530,17 @@ with st.sidebar:
     st.subheader("Blocklist Databases (Deduplication)")
     st.caption("Select Airtable databases to exclude from results")
     
-    # Create options list for multi-select
-    blocklist_options = {f"{db['name']} ({db['base_id']})": db for db in BLOCKLIST_DATABASES}
-    selected_blocklist_names = st.multiselect(
-        "Select blocklist databases",
-        options=list(blocklist_options.keys()),
-        default=[],  # Default to none selected
-        help="Select one or more databases to use as blocklists for deduplication"
-    )
-    
-    # Get selected database configs
-    selected_blocklist_dbs = [blocklist_options[name] for name in selected_blocklist_names]
+    # Create checkboxes for each database
+    selected_blocklist_dbs = []
+    for db in BLOCKLIST_DATABASES:
+        display_name = f"{db['name']} ({db['base_id']})"
+        is_selected = st.checkbox(
+            display_name,
+            key=f"blocklist_{db['base_id']}",
+            help=f"Table: {db['table_id']}, View: {db['view_id']}"
+        )
+        if is_selected:
+            selected_blocklist_dbs.append(db)
 
     run_btn = st.button("Run comparison", type="primary")
     refresh_cache_btn = st.button("Refresh Gambling.com cache")
@@ -652,8 +652,9 @@ def run_pipeline(force_refresh_cache: bool = False):
                 blocklist_domains.update(fut.result() or set())
         
         st.write(f"Loaded **{len(blocklist_domains)}** blocklisted domains from **{len(all_blocklist_configs)}** database(s).")
-        if selected_blocklist_names:
-            st.info(f"📋 Selected databases: {', '.join(selected_blocklist_names)}")
+        if selected_blocklist_dbs:
+            selected_names = [db['name'] for db in selected_blocklist_dbs]
+            st.info(f"📋 Selected databases: {', '.join(selected_names)}")
     else:
         st.info("ℹ️ No blocklist databases selected. All domains will be included in results.")
     
