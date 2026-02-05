@@ -912,70 +912,70 @@ def run_pipeline(force_refresh_cache: bool = False):
             
             domain_metrics = {}
             if fetch_metrics:
-            st.info(f"📊 Fetching DR/Traffic for {len(unique_domains)} unique domains...")
-            
-            # Create a method to fetch DR/Traffic for a domain
-            def fetch_domain_metrics(domain: str) -> Tuple[Optional[int], Optional[int]]:
-                """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
-                try:
-                    # Query the domain itself to get its metrics
-                    params = {
-                        "target": f"{domain}/",
-                        "mode": "domain",
-                        "limit": 1,
-                        "select": "domain,domain_rating,traffic",
-                    }
-                    result = ah._get(ah.EP_REFDOMAINS, params)
-                    # Response might have different structures
-                    rows = (result.get("referring_domains") or 
-                           result.get("data", {}).get("rows", []) or 
-                           result.get("rows", []) or
-                           [result] if isinstance(result, dict) and "domain" in result else [])
-                    
-                    for r in rows:
-                        # Check if this row matches our domain
-                        row_domain = r.get("domain") or r.get("referring_domain")
-                        if row_domain:
-                            reg = extract_registrable_domain(row_domain)
-                            if reg == domain:
-                                dr = r.get("domain_rating") or r.get("dr") or 0
-                                traffic = r.get("traffic") or r.get("organic_traffic") or 0
-                                return (int(dr) if isinstance(dr, (int, float)) and dr > 0 else None, 
-                                       int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None)
-                except Exception:
-                    pass
-                return None, None
-            
-            # Fetch DR/Traffic for all unique domains (with progress and higher concurrency)
-            prog_metrics = st.progress(0.0)
-            status_text = st.empty()
-            with ThreadPoolExecutor(max_workers=min(20, len(unique_domains))) as pool:
-                futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
-                done = 0
-                for fut in as_completed(futures):
-                    domain = futures[fut]
-                    dr, traffic = fut.result()
-                    domain_metrics[domain] = {"dr": dr, "traffic": traffic}
-                    done += 1
-                    progress = done / len(unique_domains)
-                    prog_metrics.progress(progress)
-                    if done % 50 == 0 or done == len(unique_domains):
-                        status_text.text(f"📊 Progress: {done}/{len(unique_domains)} domains ({int(progress*100)}%)")
-            
-            # Add DR and Traffic to output records
-            for record in output_records:
-                domain = record["linking_domain"]
-                metrics = domain_metrics.get(domain, {})
-                record["dr"] = metrics.get("dr")
-                record["traffic"] = metrics.get("traffic")
-            
-            fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
-            st.success(f"✅ Fetched DR/Traffic data for {fetched_count}/{len(unique_domains)} domains")
-        else:
-            # Add empty DR/Traffic columns if user skipped
-            for record in output_records:
-                record["dr"] = None
-                record["traffic"] = None
+                st.info(f"📊 Fetching DR/Traffic for {len(unique_domains)} unique domains...")
+                
+                # Create a method to fetch DR/Traffic for a domain
+                def fetch_domain_metrics(domain: str) -> Tuple[Optional[int], Optional[int]]:
+                    """Fetch DR and Traffic for a single domain using /refdomains endpoint"""
+                    try:
+                        # Query the domain itself to get its metrics
+                        params = {
+                            "target": f"{domain}/",
+                            "mode": "domain",
+                            "limit": 1,
+                            "select": "domain,domain_rating,traffic",
+                        }
+                        result = ah._get(ah.EP_REFDOMAINS, params)
+                        # Response might have different structures
+                        rows = (result.get("referring_domains") or 
+                               result.get("data", {}).get("rows", []) or 
+                               result.get("rows", []) or
+                               [result] if isinstance(result, dict) and "domain" in result else [])
+                        
+                        for r in rows:
+                            # Check if this row matches our domain
+                            row_domain = r.get("domain") or r.get("referring_domain")
+                            if row_domain:
+                                reg = extract_registrable_domain(row_domain)
+                                if reg == domain:
+                                    dr = r.get("domain_rating") or r.get("dr") or 0
+                                    traffic = r.get("traffic") or r.get("organic_traffic") or 0
+                                    return (int(dr) if isinstance(dr, (int, float)) and dr > 0 else None, 
+                                           int(traffic) if isinstance(traffic, (int, float)) and traffic > 0 else None)
+                    except Exception:
+                        pass
+                    return None, None
+                
+                # Fetch DR/Traffic for all unique domains (with progress and higher concurrency)
+                prog_metrics = st.progress(0.0)
+                status_text = st.empty()
+                with ThreadPoolExecutor(max_workers=min(20, len(unique_domains))) as pool:
+                    futures = {pool.submit(fetch_domain_metrics, d): d for d in unique_domains}
+                    done = 0
+                    for fut in as_completed(futures):
+                        domain = futures[fut]
+                        dr, traffic = fut.result()
+                        domain_metrics[domain] = {"dr": dr, "traffic": traffic}
+                        done += 1
+                        progress = done / len(unique_domains)
+                        prog_metrics.progress(progress)
+                        if done % 50 == 0 or done == len(unique_domains):
+                            status_text.text(f"📊 Progress: {done}/{len(unique_domains)} domains ({int(progress*100)}%)")
+                
+                # Add DR and Traffic to output records
+                for record in output_records:
+                    domain = record["linking_domain"]
+                    metrics = domain_metrics.get(domain, {})
+                    record["dr"] = metrics.get("dr")
+                    record["traffic"] = metrics.get("traffic")
+                
+                fetched_count = sum(1 for m in domain_metrics.values() if m.get("dr") is not None or m.get("traffic") is not None)
+                st.success(f"✅ Fetched DR/Traffic data for {fetched_count}/{len(unique_domains)} domains")
+            else:
+                # Add empty DR/Traffic columns if user skipped
+                for record in output_records:
+                    record["dr"] = None
+                    record["traffic"] = None
                 st.info("ℹ️ Skipped DR/Traffic fetching. Results will show without these metrics.")
         else:
             st.info("✅ DR and Traffic data already included from backlinks data")
