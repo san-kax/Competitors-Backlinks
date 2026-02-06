@@ -139,9 +139,7 @@ class AirtableClient:
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     EP_BACKLINKS = "/site-explorer/all-backlinks"
-    EP_NEW_BACKLINKS = "/site-explorer/new-backlinks"  # Alternative endpoint for new backlinks
     EP_REFDOMAINS = "/site-explorer/refdomains"
-    EP_NEW_REFDOMAINS = "/site-explorer/new-refdomains"  # New referring domains endpoint
     EP_BATCH_ANALYSIS = "/batch-analysis/batch-analysis"
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
@@ -361,14 +359,12 @@ class AhrefsClient:
         """
         Fetch new backlinks for a competitor using Ahrefs API v3.
 
-        Tries multiple endpoints in order:
-        1. /site-explorer/new-backlinks (specifically for new backlinks with date range)
-        2. /site-explorer/new-refdomains (new referring domains)
-        3. /site-explorer/all-backlinks (fallback with date filtering)
+        Uses /site-explorer/all-backlinks ordered by first_seen_link desc,
+        then filters client-side to only include backlinks within the date window.
+        (The v3 API does not have /new-backlinks or /new-refdomains endpoints.)
         """
         start_iso, end_iso = iso_window_last_n_days(days)
         start_date = start_iso[:10]  # YYYY-MM-DD
-        end_date = end_iso[:10]
 
         # Clean target - remove protocol if present
         target_clean = target
@@ -378,132 +374,57 @@ class AhrefsClient:
             target_clean = target_clean[8:]
         target_clean = target_clean.rstrip("/")
 
-        rows = []
-        success = False
-        last_error = None
+        if show_debug:
+            st.write(f"🔍 {target_clean}: Calling API with params...")
 
-        # APPROACH 1: Try /new-backlinks endpoint (designed for date-range queries)
-        if not success:
-            try:
-                params = {
-                    "target": target_clean,
-                    "mode": "subdomains",
-                    "date_from": start_date,
-                    "date_to": end_date,
-                    "limit": 1000,
-                    "output": "json",
-                    "select": "url_from,date_discovered",
-                }
+        try:
+            params = {
+                "target": target_clean,
+                "mode": "subdomains",
+                "limit": 1000,
+                "output": "json",
+                "select": "url_from,first_seen_link",
+                "order_by": "first_seen_link:desc",
+            }
 
-                if show_debug:
-                    st.write(f"🔍 {target_clean}: Trying /new-backlinks endpoint...")
+            rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
 
-                data = self._get(self.EP_NEW_BACKLINKS, params)
-                rows = data.get("backlinks", []) or data.get("new_backlinks", []) or []
+            if show_debug:
+                st.info(f"📊 {target_clean}: /all-backlinks returned {len(rows)} backlinks")
 
-                if rows:
-                    success = True
-                    if show_debug:
-                        st.success(f"✅ {target_clean}: /new-backlinks returned {len(rows)} backlinks")
+        except requests.HTTPError as e:
+            last_error = str(e)
+            if show_debug:
+                st.error(f"❌ {target_clean}: API call failed - {last_error[:150]}")
+            return []
 
-            except requests.HTTPError as e:
-                last_error = str(e)
-                if show_debug:
-                    st.warning(f"⚠️ {target_clean}: /new-backlinks failed - {last_error[:100]}")
-
-        # APPROACH 2: Try /new-refdomains endpoint
-        if not success:
-            try:
-                params = {
-                    "target": target_clean,
-                    "mode": "subdomains",
-                    "date_from": start_date,
-                    "date_to": end_date,
-                    "limit": 1000,
-                    "output": "json",
-                    "select": "domain,date_discovered",
-                }
-
-                if show_debug:
-                    st.write(f"🔍 {target_clean}: Trying /new-refdomains endpoint...")
-
-                data = self._get(self.EP_NEW_REFDOMAINS, params)
-                rows = data.get("refdomains", []) or data.get("new_refdomains", []) or data.get("referring_domains", []) or []
-
-                if rows:
-                    success = True
-                    if show_debug:
-                        st.success(f"✅ {target_clean}: /new-refdomains returned {len(rows)} domains")
-
-            except requests.HTTPError as e:
-                last_error = str(e)
-                if show_debug:
-                    st.warning(f"⚠️ {target_clean}: /new-refdomains failed - {last_error[:100]}")
-
-        # APPROACH 3: Fall back to /all-backlinks with date filtering
-        if not success:
-            try:
-                params = {
-                    "target": target_clean,
-                    "mode": "subdomains",
-                    "limit": 1000,
-                    "output": "json",
-                    "select": "url_from,first_seen_link",
-                    "order_by": "first_seen_link:desc",
-                }
-
-                if show_debug:
-                    st.write(f"🔍 {target_clean}: Trying /all-backlinks endpoint...")
-
-                rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
-                success = True
-
-                if show_debug:
-                    st.info(f"📊 {target_clean}: /all-backlinks returned {len(rows)} backlinks")
-
-            except requests.HTTPError as e:
-                last_error = str(e)
-                if show_debug:
-                    st.error(f"❌ {target_clean}: All approaches failed - {last_error[:150]}")
-                return []
-
-        # Process results
+        # Filter to only backlinks within the date window
         results = []
         for r in rows:
-            # Handle different response formats
-            url = r.get("url_from") or r.get("url") or ""
-            domain = r.get("domain") or ""
-
-            if url:
-                host = url_to_host(url)
-                reg = extract_registrable_domain(host)
-            elif domain:
-                reg = extract_registrable_domain(domain)
-            else:
+            url = r.get("url_from") or ""
+            if not url:
                 continue
 
+            host = url_to_host(url)
+            reg = extract_registrable_domain(host)
             if not reg:
                 continue
 
-            # Get date from various possible fields
-            first_seen = r.get("first_seen_link") or r.get("date_discovered") or r.get("date") or ""
+            first_seen = r.get("first_seen_link") or ""
 
-            # Filter by date if we have date info and used all-backlinks endpoint
+            # Only include backlinks first seen within our date window
             if first_seen and len(first_seen) >= 10:
                 first_seen_date = first_seen[:10]
                 if first_seen_date >= start_date:
                     results.append({
-                        "source_url": url or f"https://{reg}",
+                        "source_url": url,
                         "first_seen": first_seen,
                         "domain": reg
                     })
-            else:
-                # No date info - include it (from new-backlinks/new-refdomains it's already filtered)
-                results.append({
-                    "source_url": url or f"https://{reg}",
-                    "first_seen": first_seen or "in date range",
-                    "domain": reg
-                })
+                else:
+                    # Since results are ordered by first_seen_link desc,
+                    # once we see a date before our window, we can stop
+                    break
 
         if show_debug:
             st.success(f"✅ {target_clean}: {len(results)} new backlinks/domains found")
@@ -1120,12 +1041,13 @@ if refresh_cache_btn:
 # Footer
 st.divider()
 st.caption("""
-**v3.0.6** — Auth fix + Honest error reporting
+**v3.0.6** — Auth fix + Correct endpoints + Honest error reporting
 - Fixed: AirtableClient no longer overwrites AhrefsClient auth on shared session
+- Fixed: Removed non-existent /new-backlinks and /new-refdomains endpoints (404s)
+- Fixed: Uses /all-backlinks with order_by + early-exit date filtering
 - Fixed: Batch Analysis 401 errors no longer silently converted to DR=0/Traffic=0
 - Fixed: Test panel accurately reports auth failures instead of fake success
 - Added: API plan detection (Enterprise vs free-test-only)
 - Uses `/batch-analysis` endpoint for DR/Traffic
 - Parallel Airtable & backlink fetches
-- DR/Traffic filter can be disabled
 """)
