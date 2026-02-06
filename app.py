@@ -1,4 +1,4 @@
-# v3.0.4 — BATCH ANALYSIS API for maximum efficiency:
+# v3.0.6 — AUTH FIX + HONEST ERROR REPORTING:
 #   • Uses /batch-analysis endpoint to get DR/Traffic for many domains in ONE call
 #   • Fetches new backlinks per competitor, collects unique domains
 #   • Single batch call for metrics (vs individual calls per domain)
@@ -100,9 +100,10 @@ def make_session(pool_size: int = 100) -> requests.Session:
 
 # ---------------- Airtable Client ----------------
 class AirtableClient:
-    def __init__(self, api_key: str, base_id: str, session: Optional[requests.Session] = None):
+    def __init__(self, api_key: str, base_id: str):
         self.base_url = f"https://api.airtable.com/v0/{base_id}"
-        self.session = session or make_session()
+        # Uses its own session to avoid overwriting auth headers on a shared session
+        self.session = make_session()
         self.session.headers.update({"Authorization": f"Bearer {api_key}"})
 
     def fetch_domains(self, table_or_id: str, domain_field: str,
@@ -138,7 +139,9 @@ class AirtableClient:
 class AhrefsClient:
     BASE = "https://api.ahrefs.com/v3"
     EP_BACKLINKS = "/site-explorer/all-backlinks"
+    EP_NEW_BACKLINKS = "/site-explorer/new-backlinks"  # Alternative endpoint for new backlinks
     EP_REFDOMAINS = "/site-explorer/refdomains"
+    EP_NEW_REFDOMAINS = "/site-explorer/new-refdomains"  # New referring domains endpoint
     EP_BATCH_ANALYSIS = "/batch-analysis/batch-analysis"
 
     def __init__(self, token: str, session: Optional[requests.Session] = None):
@@ -154,6 +157,10 @@ class AhrefsClient:
         """Execute GET request with error handling."""
         r = self.session.get(f"{self.BASE}{path}", params=params, timeout=timeout)
         if not r.ok:
+            error_text = r.text[:300] if r.text else "No error details"
+            if r.status_code == 401:
+                # Unauthorized - API doesn't have access to this domain
+                raise requests.HTTPError(f"UNAUTHORIZED: No API access to query this domain (HTTP 401)")
             if r.status_code == 403:
                 try:
                     error_data = r.json()
@@ -161,13 +168,16 @@ class AhrefsClient:
                         raise requests.HTTPError(f"API units limit reached: {error_data}")
                 except json.JSONDecodeError:
                     pass
-            raise requests.HTTPError(f"Ahrefs v3 {path} failed: HTTP {r.status_code} :: {r.text[:300]}")
+            raise requests.HTTPError(f"Ahrefs v3 {path} failed: HTTP {r.status_code} :: {error_text}")
         return r.json()
 
     def _post(self, path: str, json_data: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
         """Execute POST request with error handling."""
         r = self.session.post(f"{self.BASE}{path}", json=json_data, timeout=timeout)
         if not r.ok:
+            error_text = r.text[:500] if r.text else "No error details"
+            if r.status_code == 401:
+                raise requests.HTTPError(f"UNAUTHORIZED: No API access (HTTP 401)")
             if r.status_code == 403:
                 try:
                     error_data = r.json()
@@ -175,7 +185,7 @@ class AhrefsClient:
                         raise requests.HTTPError(f"API units limit reached: {error_data}")
                 except json.JSONDecodeError:
                     pass
-            raise requests.HTTPError(f"Ahrefs v3 POST {path} failed: HTTP {r.status_code} :: {r.text[:500]}")
+            raise requests.HTTPError(f"Ahrefs v3 POST {path} failed: HTTP {r.status_code} :: {error_text}")
         return r.json()
 
     def _paginate(self, path: str, params: Dict[str, Any],
@@ -283,8 +293,7 @@ class AhrefsClient:
             payload = {
                 "targets": targets,
                 "select": ["url", "domain_rating", "org_traffic"],
-                "volume_mode": "monthly",
-                "output": "json"
+                "volume_mode": "monthly"
             }
 
             try:
@@ -316,15 +325,30 @@ class AhrefsClient:
                         self._domain_metrics_cache[domain] = results[domain]
 
             except requests.HTTPError as e:
+                error_msg = str(e)
+                is_auth_error = "UNAUTHORIZED" in error_msg or "401" in error_msg
                 if show_debug:
-                    st.warning(f"⚠️ Batch {batch_num} failed: {str(e)[:100]}")
-                # On failure, set defaults for this batch
-                for domain in batch:
-                    if domain not in results:
-                        results[domain] = {"dr": 0, "traffic": 0}
+                    st.warning(f"⚠️ Batch {batch_num} failed: {error_msg[:100]}")
+                if is_auth_error:
+                    # Don't silently default to zeros on auth errors — propagate clearly
+                    st.error(f"❌ Batch Analysis API returned 401 Unauthorized. "
+                             f"Check your API key and plan permissions.")
+                    for domain in batch:
+                        if domain not in results:
+                            results[domain] = {"dr": None, "traffic": None, "error": "unauthorized"}
+                else:
+                    # Non-auth errors: set defaults for this batch
+                    for domain in batch:
+                        if domain not in results:
+                            results[domain] = {"dr": 0, "traffic": 0}
 
+        successful = sum(1 for v in results.values() if v.get("error") is None)
         if show_debug:
-            st.success(f"✅ Got metrics for {len(results)} domains via Batch Analysis API")
+            if successful == len(results):
+                st.success(f"✅ Got metrics for {len(results)} domains via Batch Analysis API")
+            else:
+                st.warning(f"⚠️ Got metrics for {successful}/{len(results)} domains "
+                           f"({len(results) - successful} failed with auth errors)")
 
         return results
 
@@ -337,21 +361,16 @@ class AhrefsClient:
         """
         Fetch new backlinks for a competitor using Ahrefs API v3.
 
-        API endpoint: /site-explorer/all-backlinks
-        Based on docs: https://docs.ahrefs.com/docs/api/site-explorer/operations/list-all-backlinks
-
-        Key parameters:
-        - target: URL/domain to analyze (required)
-        - mode: exact, prefix, domain, subdomains (required)
-        - select: Comma-separated list of columns (required for output)
-        - limit: Max rows per page (default 1000)
-        - output: json
+        Tries multiple endpoints in order:
+        1. /site-explorer/new-backlinks (specifically for new backlinks with date range)
+        2. /site-explorer/new-refdomains (new referring domains)
+        3. /site-explorer/all-backlinks (fallback with date filtering)
         """
         start_iso, end_iso = iso_window_last_n_days(days)
         start_date = start_iso[:10]  # YYYY-MM-DD
+        end_date = end_iso[:10]
 
-        # Target should be the bare domain for "subdomains" mode
-        # Remove any protocol if present
+        # Clean target - remove protocol if present
         target_clean = target
         if target_clean.startswith("http://"):
             target_clean = target_clean[7:]
@@ -360,40 +379,73 @@ class AhrefsClient:
         target_clean = target_clean.rstrip("/")
 
         rows = []
-        error_msg = None
+        success = False
+        last_error = None
 
-        # Primary approach: Use the backlinks endpoint with proper parameters
-        try:
-            # Based on API docs, use minimal required params
-            params = {
-                "target": target_clean,
-                "mode": "subdomains",  # subdomains mode captures all links to domain and subdomains
-                "limit": 1000,
-                "output": "json",
-                "select": "url_from,first_seen_link,domain_rating_source",
-                "order_by": "first_seen_link:desc",
-            }
-
-            if show_debug:
-                st.write(f"🔍 {target_clean}: Calling API with params: {params}")
-
-            rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
-
-            if show_debug:
-                st.info(f"📊 {target_clean}: API returned {len(rows)} total backlinks")
-                if rows and len(rows) > 0:
-                    st.write(f"   First row sample: {rows[0]}")
-
-        except requests.HTTPError as e:
-            error_msg = str(e)
-            if show_debug:
-                st.warning(f"⚠️ {target_clean}: Primary approach failed - {error_msg[:150]}")
-
-            # Fallback: Try with "domain" mode instead of "subdomains"
+        # APPROACH 1: Try /new-backlinks endpoint (designed for date-range queries)
+        if not success:
             try:
                 params = {
                     "target": target_clean,
-                    "mode": "domain",
+                    "mode": "subdomains",
+                    "date_from": start_date,
+                    "date_to": end_date,
+                    "limit": 1000,
+                    "output": "json",
+                    "select": "url_from,date_discovered",
+                }
+
+                if show_debug:
+                    st.write(f"🔍 {target_clean}: Trying /new-backlinks endpoint...")
+
+                data = self._get(self.EP_NEW_BACKLINKS, params)
+                rows = data.get("backlinks", []) or data.get("new_backlinks", []) or []
+
+                if rows:
+                    success = True
+                    if show_debug:
+                        st.success(f"✅ {target_clean}: /new-backlinks returned {len(rows)} backlinks")
+
+            except requests.HTTPError as e:
+                last_error = str(e)
+                if show_debug:
+                    st.warning(f"⚠️ {target_clean}: /new-backlinks failed - {last_error[:100]}")
+
+        # APPROACH 2: Try /new-refdomains endpoint
+        if not success:
+            try:
+                params = {
+                    "target": target_clean,
+                    "mode": "subdomains",
+                    "date_from": start_date,
+                    "date_to": end_date,
+                    "limit": 1000,
+                    "output": "json",
+                    "select": "domain,date_discovered",
+                }
+
+                if show_debug:
+                    st.write(f"🔍 {target_clean}: Trying /new-refdomains endpoint...")
+
+                data = self._get(self.EP_NEW_REFDOMAINS, params)
+                rows = data.get("refdomains", []) or data.get("new_refdomains", []) or data.get("referring_domains", []) or []
+
+                if rows:
+                    success = True
+                    if show_debug:
+                        st.success(f"✅ {target_clean}: /new-refdomains returned {len(rows)} domains")
+
+            except requests.HTTPError as e:
+                last_error = str(e)
+                if show_debug:
+                    st.warning(f"⚠️ {target_clean}: /new-refdomains failed - {last_error[:100]}")
+
+        # APPROACH 3: Fall back to /all-backlinks with date filtering
+        if not success:
+            try:
+                params = {
+                    "target": target_clean,
+                    "mode": "subdomains",
                     "limit": 1000,
                     "output": "json",
                     "select": "url_from,first_seen_link",
@@ -401,61 +453,62 @@ class AhrefsClient:
                 }
 
                 if show_debug:
-                    st.write(f"🔍 {target_clean}: Fallback with mode=domain...")
+                    st.write(f"🔍 {target_clean}: Trying /all-backlinks endpoint...")
 
                 rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
+                success = True
 
                 if show_debug:
-                    st.info(f"📊 {target_clean}: Fallback returned {len(rows)} backlinks")
+                    st.info(f"📊 {target_clean}: /all-backlinks returned {len(rows)} backlinks")
 
-            except requests.HTTPError as e2:
+            except requests.HTTPError as e:
+                last_error = str(e)
                 if show_debug:
-                    st.error(f"❌ {target_clean}: All approaches failed - {str(e2)[:150]}")
+                    st.error(f"❌ {target_clean}: All approaches failed - {last_error[:150]}")
                 return []
 
-        # Process and filter results by date
+        # Process results
         results = []
         for r in rows:
-            url = r.get("url_from")
-            if not url:
+            # Handle different response formats
+            url = r.get("url_from") or r.get("url") or ""
+            domain = r.get("domain") or ""
+
+            if url:
+                host = url_to_host(url)
+                reg = extract_registrable_domain(host)
+            elif domain:
+                reg = extract_registrable_domain(domain)
+            else:
                 continue
 
-            host = url_to_host(url)
-            reg = extract_registrable_domain(host)
             if not reg:
                 continue
 
-            first_seen = r.get("first_seen_link", "")
+            # Get date from various possible fields
+            first_seen = r.get("first_seen_link") or r.get("date_discovered") or r.get("date") or ""
 
-            # Filter: only include backlinks from within our date window
-            if first_seen:
-                # first_seen format: "2024-01-15T00:00:00Z" or "2024-01-15"
-                first_seen_date = first_seen[:10] if len(first_seen) >= 10 else ""
-                if first_seen_date and first_seen_date >= start_date:
+            # Filter by date if we have date info and used all-backlinks endpoint
+            if first_seen and len(first_seen) >= 10:
+                first_seen_date = first_seen[:10]
+                if first_seen_date >= start_date:
                     results.append({
-                        "source_url": url,
+                        "source_url": url or f"https://{reg}",
                         "first_seen": first_seen,
                         "domain": reg
                     })
             else:
-                # If no first_seen date, include it anyway (might be recent)
-                # but mark it as unknown
+                # No date info - include it (from new-backlinks/new-refdomains it's already filtered)
                 results.append({
-                    "source_url": url,
-                    "first_seen": "unknown",
+                    "source_url": url or f"https://{reg}",
+                    "first_seen": first_seen or "in date range",
                     "domain": reg
                 })
 
         if show_debug:
-            st.success(f"✅ {target_clean}: {len(results)} backlinks found (filtered to last {days} days: {len([r for r in results if r.get('first_seen') != 'unknown' and r.get('first_seen', '')[:10] >= start_date])})")
+            st.success(f"✅ {target_clean}: {len(results)} new backlinks/domains found")
 
-        # Final filter to ensure we only return new backlinks
-        filtered_results = [
-            r for r in results
-            if r.get("first_seen") == "unknown" or (r.get("first_seen", "")[:10] >= start_date if len(r.get("first_seen", "")) >= 10 else True)
-        ]
-
-        return filtered_results
+        return results
 
 # ---------------- SQLite Cache ----------------
 DB_PATH = "./backlink_cache.sqlite"
@@ -604,8 +657,47 @@ if test_api_btn and AHREFS_TOKEN:
     st.write("## 🧪 API Test")
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
 
+    # Test 0: API Plan Detection — test ahrefs.com (free) vs real domain
+    st.write("### Test 0: API Plan Detection")
+    with st.spinner("Checking API plan access..."):
+        plan_test_results = {}
+        for test_target in ["ahrefs.com", "wordcount.com", "moz.com"]:
+            try:
+                params = {
+                    "target": test_target,
+                    "mode": "subdomains",
+                    "limit": 1,
+                    "output": "json",
+                    "select": "url_from,first_seen_link",
+                }
+                response = ah._get(ah.EP_BACKLINKS, params)
+                count = len(response.get("backlinks", []))
+                plan_test_results[test_target] = f"✅ OK ({count} backlinks)"
+            except requests.HTTPError as e:
+                error_msg = str(e)
+                if "UNAUTHORIZED" in error_msg or "401" in error_msg:
+                    plan_test_results[test_target] = "❌ 401 Unauthorized"
+                else:
+                    plan_test_results[test_target] = f"❌ {error_msg[:80]}"
+
+        for target, result in plan_test_results.items():
+            st.write(f"  • `{target}`: {result}")
+
+        # Detect plan type
+        free_targets_ok = all("OK" in plan_test_results.get(t, "") for t in ["ahrefs.com", "wordcount.com"])
+        real_targets_ok = "OK" in plan_test_results.get("moz.com", "")
+
+        if free_targets_ok and real_targets_ok:
+            st.success("✅ Full API access confirmed (Enterprise plan)")
+        elif free_targets_ok and not real_targets_ok:
+            st.error("❌ API token only works on test targets (ahrefs.com, wordcount.com). "
+                     "Your plan does not support querying third-party domains. "
+                     "Enterprise plan required for full functionality.")
+        else:
+            st.error("❌ API token may be invalid — even test targets failed.")
+
     # Test 1: Raw API call to see response structure
-    st.write("### Test 1: Raw Backlinks API Call")
+    st.write("### Test 1: Raw Backlinks API Call (ahrefs.com)")
     with st.spinner("Testing raw API call..."):
         try:
             test_target = "ahrefs.com"
@@ -637,29 +729,40 @@ if test_api_btn and AHREFS_TOKEN:
     if airtable_base_id and airtable_table and AIRTABLE_TOKEN:
         with st.spinner("Fetching first competitor..."):
             try:
-                at_test = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
+                at_test = AirtableClient(AIRTABLE_TOKEN, airtable_base_id)
                 test_comps = at_test.fetch_domains(airtable_table, airtable_domain_field, view_or_id=(airtable_view or None), max_records=3)
                 if test_comps:
                     first_comp = test_comps[0]
                     st.write(f"📤 Testing with competitor: **{first_comp}**")
 
+                    # Use AhrefsClient (which has its own session with correct auth)
                     params = {
                         "target": first_comp,
                         "mode": "subdomains",
                         "limit": 10,
                         "output": "json",
                         "select": "url_from,first_seen_link",
-                        "order_by": "first_seen_link:desc",
                     }
-                    response = ah._get(ah.EP_BACKLINKS, params)
-                    st.write(f"📥 Response keys: {list(response.keys())}")
-                    if "backlinks" in response:
-                        st.success(f"✅ Found {len(response['backlinks'])} backlinks for {first_comp}")
-                        if response['backlinks']:
-                            st.write("First backlink:")
-                            st.json(response['backlinks'][0])
-                    else:
-                        st.json(response)
+                    st.write(f"📤 Params: {params}")
+
+                    try:
+                        response = ah._get(ah.EP_BACKLINKS, params)
+                        st.write(f"📥 Response keys: {list(response.keys())}")
+                        if "backlinks" in response:
+                            st.success(f"✅ Found {len(response['backlinks'])} backlinks for {first_comp}")
+                            if response['backlinks']:
+                                st.write("First backlink:")
+                                st.json(response['backlinks'][0])
+                        else:
+                            st.json(response)
+                    except requests.HTTPError as e:
+                        error_msg = str(e)
+                        st.error(f"❌ {error_msg[:300]}")
+                        if "UNAUTHORIZED" in error_msg or "401" in error_msg:
+                            st.warning("💡 Your API token works for test targets (ahrefs.com) "
+                                       "but not for third-party domains. This typically means "
+                                       "your Ahrefs plan does not include API access for "
+                                       "arbitrary domains (Enterprise plan required).")
                 else:
                     st.warning("No competitors found in Airtable")
             except Exception as e:
@@ -685,9 +788,21 @@ if test_api_btn and AHREFS_TOKEN:
             results = ah.batch_get_domain_metrics(test_domains, batch_size=10, show_debug=True)
 
             if results:
-                st.success(f"✅ Batch Analysis API working!")
-                for domain, metrics in results.items():
-                    st.write(f"  • {domain}: DR={metrics['dr']}, Traffic={metrics['traffic']:,}")
+                auth_errors = sum(1 for v in results.values() if v.get("error") == "unauthorized")
+                if auth_errors == 0:
+                    st.success(f"✅ Batch Analysis API working!")
+                elif auth_errors == len(results):
+                    st.error(f"❌ Batch Analysis API returned 401 for all domains. "
+                             f"Check API key and plan permissions.")
+                else:
+                    st.warning(f"⚠️ Batch Analysis: {auth_errors}/{len(results)} domains failed (401)")
+                for domain, m in results.items():
+                    if m.get("error"):
+                        st.write(f"  • {domain}: ❌ {m['error']}")
+                    else:
+                        dr = m.get('dr', 0)
+                        traffic = m.get('traffic', 0)
+                        st.write(f"  • {domain}: DR={dr}, Traffic={traffic:,}")
             else:
                 st.warning("⚠️ No results returned")
         except Exception as e:
@@ -712,7 +827,7 @@ def run_pipeline(force_refresh_cache: bool = False):
     st.info("**Using Batch Analysis API** for efficient DR/Traffic lookup")
 
     ah = AhrefsClient(AHREFS_TOKEN, session=shared_session)
-    at_primary = AirtableClient(AIRTABLE_TOKEN, airtable_base_id, session=shared_session)
+    at_primary = AirtableClient(AIRTABLE_TOKEN, airtable_base_id)
 
     # ============================================
     # PHASE 1: Load competitors and blocklists (parallel)
@@ -745,7 +860,7 @@ def run_pipeline(force_refresh_cache: bool = False):
             return set()
 
         try:
-            cli = AirtableClient(AIRTABLE_TOKEN, base_id, session=shared_session)
+            cli = AirtableClient(AIRTABLE_TOKEN, base_id)
             return set(cli.fetch_domains(table_id, BLOCKLIST_FIELD, view_or_id=view_id))
         except Exception as e:
             load_errors.append(f"{db_name}: {e}")
@@ -914,10 +1029,16 @@ def run_pipeline(force_refresh_cache: bool = False):
 
     output_records: List[Dict[str, Any]] = []
 
+    # Check if batch analysis had auth failures
+    auth_failures = sum(1 for v in metrics.values() if v.get("error") == "unauthorized")
+    if auth_failures > 0:
+        st.warning(f"⚠️ {auth_failures} domains returned 401 Unauthorized from Batch Analysis API. "
+                   f"DR/Traffic data may be unavailable. Check your Ahrefs API plan.")
+
     for domain, info in unique_domains.items():
         domain_metrics = metrics.get(domain, {"dr": 0, "traffic": 0})
-        dr = domain_metrics.get("dr", 0)
-        traffic = domain_metrics.get("traffic", 0)
+        dr = domain_metrics.get("dr") or 0
+        traffic = domain_metrics.get("traffic") or 0
 
         # Apply filter if enabled
         if enable_quality_filter:
@@ -999,11 +1120,12 @@ if refresh_cache_btn:
 # Footer
 st.divider()
 st.caption("""
-**v3.0.4** — Batch Analysis API + Fixed Backlinks Query
-- Uses `/batch-analysis` endpoint for DR/Traffic (much more efficient)
-- Fixed backlinks API call - proper target format and parameters
-- Fetches backlinks first, then batch-queries metrics
+**v3.0.6** — Auth fix + Honest error reporting
+- Fixed: AirtableClient no longer overwrites AhrefsClient auth on shared session
+- Fixed: Batch Analysis 401 errors no longer silently converted to DR=0/Traffic=0
+- Fixed: Test panel accurately reports auth failures instead of fake success
+- Added: API plan detection (Enterprise vs free-test-only)
+- Uses `/batch-analysis` endpoint for DR/Traffic
 - Parallel Airtable & backlink fetches
 - DR/Traffic filter can be disabled
-- LRU caching for domain extraction
 """)
