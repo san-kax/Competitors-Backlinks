@@ -226,18 +226,30 @@ class AhrefsClient:
         if target == "gambling.com":
             target = "www.gambling.com"
 
+        # Clean target — no trailing slash, no protocol
+        target_clean = target.rstrip("/")
+        if target_clean.startswith("http://"):
+            target_clean = target_clean[7:]
+        elif target_clean.startswith("https://"):
+            target_clean = target_clean[8:]
+
         params = {
-            "target": f"{target}/",
+            "target": target_clean,
             "mode": "subdomains",
-            "limit": 50000,
-            "history": "all_time",
-            "protocol": "both",
-            "select": "domain"
+            "limit": 1000,
+            "output": "json",
+            "select": "domain",
+            "order_by": "domain_rating:desc",
         }
 
         try:
-            st.info("🔄 Fetching baseline referring domains...")
-            rows = self._paginate(self.EP_REFDOMAINS, params, show_progress=True)
+            st.info(f"🔄 Fetching baseline referring domains for `{target_clean}`...")
+            rows = self._paginate(self.EP_REFDOMAINS, params, max_items=200000, show_progress=True)
+
+            if not rows:
+                st.warning(f"⚠️ /refdomains returned 0 rows for `{target_clean}`")
+                return [], f"/refdomains returned 0 rows"
+
             domains = []
             for r in rows:
                 cand = r.get("domain") or r.get("referring_domain") or r.get("host")
@@ -249,6 +261,7 @@ class AhrefsClient:
             st.success(f"✅ Fetched {len(unique_domains):,} baseline domains")
             return unique_domains, f"/refdomains [{len(unique_domains):,} domains]"
         except requests.HTTPError as e:
+            st.error(f"❌ /refdomains failed: {str(e)[:200]}")
             return [], f"/refdomains failed ({str(e)[:90]}…)"
 
     def batch_get_domain_metrics(
@@ -826,8 +839,7 @@ def run_pipeline(force_refresh_cache: bool = False):
         st.success(f"✅ Cache hit: {len(gdc_ref_domains):,} domains (cached {fetched_at.strftime('%Y-%m-%d %H:%M')})")
     else:
         with st.spinner("Fetching baseline domains..."):
-            t_target = "www.gambling.com" if "www." not in gambling_domain else gambling_domain
-            gdc_ref_domains, note = ah.get_baseline_domains(t_target)
+            gdc_ref_domains, note = ah.get_baseline_domains(gambling_domain)
 
             if gdc_ref_domains:
                 save_ref_domains_to_cache(gambling_domain, gdc_ref_domains)
