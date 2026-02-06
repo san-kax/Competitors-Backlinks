@@ -224,7 +224,14 @@ class AhrefsClient:
         return out
 
     def get_baseline_domains(self, target: str) -> Tuple[List[str], str]:
-        """Get baseline referring domains using /refdomains endpoint."""
+        """
+        Get LIVE baseline referring domains using /all-backlinks endpoint.
+
+        Uses the same approach as Ahrefs UI "Live links only" toggle:
+        - aggregation=1_per_domain (one link per referring domain)
+        - where={"field":"last_seen","is":"is_null"} (live links only)
+        - history=all_time, protocol=both
+        """
         if target == "gambling.com":
             target = "www.gambling.com"
 
@@ -235,62 +242,72 @@ class AhrefsClient:
         elif target_clean.startswith("https://"):
             target_clean = target_clean[8:]
 
-        # Fetch only LIVE referring domains (backlinks > 0 means at least one active link)
-        # This avoids excluding domains whose links to gambling.com have been removed
-        live_filter = 'gt(backlinks,0)'
+        # Live-only filter: last_seen is null means link is still active
+        live_filter = json.dumps({"field": "last_seen", "is": "is_null"})
 
         params = {
             "target": target_clean,
             "mode": "subdomains",
             "limit": 200000,
             "output": "json",
-            "select": "domain",
-            "order_by": "domain_rating:desc",
+            "select": "url_from",
+            "aggregation": "1_per_domain",
+            "history": "all_time",
+            "protocol": "both",
             "where": live_filter,
         }
 
         try:
             st.info(f"🔄 Fetching **live** baseline referring domains for `{target_clean}`...")
-            data = self._get(self.EP_REFDOMAINS, params, timeout=300)
-            rows = data.get("refdomains", [])
-
-            if not rows:
-                # If where filter not supported, retry without it
-                st.warning(f"⚠️ Live filter returned 0 rows, retrying without filter...")
-                del params["where"]
-                data = self._get(self.EP_REFDOMAINS, params, timeout=300)
-                rows = data.get("refdomains", [])
-
+            data = self._get(self.EP_BACKLINKS, params, timeout=300)
+            rows = data.get("backlinks", [])
         except requests.HTTPError as e:
             error_msg = str(e)
-            if "400" in error_msg or "where" in error_msg.lower():
-                # where filter not supported on this endpoint — fall back to unfiltered
-                st.warning("⚠️ where filter not supported for /refdomains, fetching all...")
-                try:
-                    del params["where"]
-                    data = self._get(self.EP_REFDOMAINS, params, timeout=300)
-                    rows = data.get("refdomains", [])
-                except requests.HTTPError as e2:
-                    st.error(f"❌ /refdomains failed: {str(e2)[:200]}")
-                    return [], f"/refdomains failed ({str(e2)[:90]}…)"
-            else:
-                st.error(f"❌ /refdomains failed: {error_msg[:200]}")
-                return [], f"/refdomains failed ({error_msg[:90]}…)"
+            st.warning(f"⚠️ Live backlinks approach failed ({error_msg[:100]}), "
+                       f"falling back to /refdomains...")
+            # Fallback to /refdomains (includes dead links but still useful)
+            try:
+                fallback_params = {
+                    "target": target_clean,
+                    "mode": "subdomains",
+                    "limit": 200000,
+                    "output": "json",
+                    "select": "domain",
+                    "order_by": "domain_rating:desc",
+                }
+                data = self._get(self.EP_REFDOMAINS, fallback_params, timeout=300)
+                rows_fb = data.get("refdomains", [])
+                domains = []
+                for r in rows_fb:
+                    cand = r.get("domain") or ""
+                    if cand:
+                        reg = extract_registrable_domain(cand)
+                        if reg:
+                            domains.append(reg)
+                unique_domains = sorted(set(domains))
+                st.success(f"✅ Fetched {len(unique_domains):,} baseline domains (via /refdomains fallback)")
+                return unique_domains, f"/refdomains fallback [{len(unique_domains):,} domains]"
+            except requests.HTTPError as e2:
+                st.error(f"❌ Both approaches failed: {str(e2)[:200]}")
+                return [], f"Failed ({str(e2)[:90]}…)"
 
         if not rows:
-            st.warning(f"⚠️ /refdomains returned 0 rows for `{target_clean}`")
-            return [], f"/refdomains returned 0 rows"
+            st.warning(f"⚠️ /all-backlinks returned 0 live links for `{target_clean}`")
+            return [], f"/all-backlinks returned 0 rows"
 
+        # Extract unique domains from url_from
         domains = []
         for r in rows:
-            cand = r.get("domain") or r.get("referring_domain") or r.get("host")
-            if cand:
-                reg = extract_registrable_domain(cand)
+            url = r.get("url_from") or ""
+            if url:
+                host = url_to_host(url)
+                reg = extract_registrable_domain(host)
                 if reg:
                     domains.append(reg)
+
         unique_domains = sorted(set(domains))
         st.success(f"✅ Fetched {len(unique_domains):,} live baseline domains")
-        return unique_domains, f"/refdomains [{len(unique_domains):,} live domains]"
+        return unique_domains, f"/all-backlinks live [{len(unique_domains):,} domains]"
 
     def batch_get_domain_metrics(
         self,
@@ -421,8 +438,13 @@ class AhrefsClient:
         if show_debug:
             st.write(f"🔍 {target_clean}: Fetching backlinks (window: {start_date})...")
 
-        # Try with server-side where filter first (saves credits if supported)
-        where_filter = f'gte(first_seen_link,"{start_date}")'
+        # Server-side where filter using JSON format (same as Ahrefs UI)
+        where_filter = json.dumps({
+            "and": [
+                {"field": "first_seen_link", "is": "gte", "value": start_date},
+                {"field": "last_seen", "is": "is_null"}
+            ]
+        })
 
         try:
             params = {
@@ -433,15 +455,18 @@ class AhrefsClient:
                 "select": "url_from,first_seen_link",
                 "order_by": "first_seen_link:desc",
                 "where": where_filter,
+                "aggregation": "1_per_domain",
+                "history": "all_time",
+                "protocol": "both",
             }
 
             data = self._get(self.EP_BACKLINKS, params, timeout=120)
             rows = data.get("backlinks", [])
 
             if show_debug:
-                st.info(f"📊 {target_clean}: where filter returned {len(rows)} backlinks")
+                st.info(f"📊 {target_clean}: where filter returned {len(rows)} live backlinks")
 
-            # If we got exactly 1000, there may be more — fetch next batch
+            # If we got exactly 1000, there may be more — increase limit
             if len(rows) == 1000:
                 params["limit"] = 10000
                 data = self._get(self.EP_BACKLINKS, params, timeout=120)
@@ -451,13 +476,11 @@ class AhrefsClient:
 
         except requests.HTTPError as e:
             error_msg = str(e)
-            # If where filter is not supported, fall back to order_by + client-side filtering
-            if "400" in error_msg or "where" in error_msg.lower():
+            # If where filter fails, fall back to order_by + client-side filtering
+            if "400" in error_msg or "where" in error_msg.lower() or "422" in error_msg:
                 if show_debug:
                     st.warning(f"⚠️ {target_clean}: where filter not supported, using client-side filtering")
                 try:
-                    # Smart limit: estimate rows needed based on days
-                    # Typical site gets ~100-500 new backlinks/day, use 500/day as safe upper bound
                     smart_limit = min(max(days * 500, 1000), 50000)
                     params = {
                         "target": target_clean,
@@ -772,25 +795,42 @@ if test_api_btn and AHREFS_TOKEN:
             except Exception as e:
                 st.error(f"❌ Competitor test failed: {e}")
 
-    # Test 1c: Refdomains endpoint (limit=1 to minimize credits)
-    st.write("### Test 1c: Refdomains Endpoint")
-    with st.spinner("Testing /refdomains endpoint..."):
+    # Test 1c: Discover available fields on /all-backlinks
+    st.write("### Test 1c: Backlinks Field Discovery")
+    with st.spinner("Probing available fields..."):
+        # First get all fields with select=*
         try:
             params = {
                 "target": "ahrefs.com",
                 "mode": "subdomains",
                 "limit": 1,
                 "output": "json",
-                "select": "domain",
+            }
+            response = ah._get(ah.EP_BACKLINKS, params)
+            backlinks = response.get("backlinks", [])
+            if backlinks:
+                st.write(f"📥 **All fields returned by /all-backlinks:** `{list(backlinks[0].keys())}`")
+                st.json(backlinks[0])
+            else:
+                st.warning("⚠️ No backlinks returned")
+        except Exception as e:
+            st.error(f"❌ Field discovery failed: {e}")
+
+        # Also check /refdomains fields
+        try:
+            params = {
+                "target": "ahrefs.com",
+                "mode": "subdomains",
+                "limit": 1,
+                "output": "json",
             }
             response = ah._get(ah.EP_REFDOMAINS, params)
             refdomains = response.get("refdomains", [])
             if refdomains:
-                st.success(f"✅ /refdomains working (returned {len(refdomains)} domain)")
-            else:
-                st.warning("⚠️ /refdomains returned 0 rows")
+                st.write(f"📥 **All fields returned by /refdomains:** `{list(refdomains[0].keys())}`")
+                st.json(refdomains[0])
         except Exception as e:
-            st.error(f"❌ Refdomains test failed: {e}")
+            st.error(f"❌ Refdomains field discovery failed: {e}")
 
     # Test 2: Backlinks fetch function (uses small window to minimize credits)
     st.write("### Test 2: Backlinks Fetch Function")
