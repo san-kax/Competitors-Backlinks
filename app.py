@@ -235,10 +235,11 @@ class AhrefsClient:
         elif target_clean.startswith("https://"):
             target_clean = target_clean[8:]
 
+        # Ahrefs API has no hard cap on limit — fetch all in one call
         params = {
             "target": target_clean,
             "mode": "subdomains",
-            "limit": 1000,
+            "limit": 200000,
             "output": "json",
             "select": "domain",
             "order_by": "domain_rating:desc",
@@ -246,7 +247,8 @@ class AhrefsClient:
 
         try:
             st.info(f"🔄 Fetching baseline referring domains for `{target_clean}`...")
-            rows = self._paginate(self.EP_REFDOMAINS, params, max_items=200000, show_progress=True)
+            data = self._get(self.EP_REFDOMAINS, params, timeout=300)
+            rows = data.get("refdomains", [])
 
             if not rows:
                 st.warning(f"⚠️ /refdomains returned 0 rows for `{target_clean}`")
@@ -393,16 +395,18 @@ class AhrefsClient:
             st.write(f"🔍 {target_clean}: Calling API with params...")
 
         try:
+            # Ahrefs has no hard cap on limit — fetch enough to cover the date window
             params = {
                 "target": target_clean,
                 "mode": "subdomains",
-                "limit": 1000,
+                "limit": 50000,
                 "output": "json",
                 "select": "url_from,first_seen_link",
                 "order_by": "first_seen_link:desc",
             }
 
-            rows = self._paginate(self.EP_BACKLINKS, params, max_items=5000)
+            data = self._get(self.EP_BACKLINKS, params, timeout=120)
+            rows = data.get("backlinks", [])
 
             if show_debug:
                 st.info(f"📊 {target_clean}: /all-backlinks returned {len(rows)} backlinks")
