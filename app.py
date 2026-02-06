@@ -235,7 +235,10 @@ class AhrefsClient:
         elif target_clean.startswith("https://"):
             target_clean = target_clean[8:]
 
-        # Ahrefs API has no hard cap on limit — fetch all in one call
+        # Fetch only LIVE referring domains (backlinks > 0 means at least one active link)
+        # This avoids excluding domains whose links to gambling.com have been removed
+        live_filter = 'gt(backlinks,0)'
+
         params = {
             "target": target_clean,
             "mode": "subdomains",
@@ -243,30 +246,51 @@ class AhrefsClient:
             "output": "json",
             "select": "domain",
             "order_by": "domain_rating:desc",
+            "where": live_filter,
         }
 
         try:
-            st.info(f"🔄 Fetching baseline referring domains for `{target_clean}`...")
+            st.info(f"🔄 Fetching **live** baseline referring domains for `{target_clean}`...")
             data = self._get(self.EP_REFDOMAINS, params, timeout=300)
             rows = data.get("refdomains", [])
 
             if not rows:
-                st.warning(f"⚠️ /refdomains returned 0 rows for `{target_clean}`")
-                return [], f"/refdomains returned 0 rows"
+                # If where filter not supported, retry without it
+                st.warning(f"⚠️ Live filter returned 0 rows, retrying without filter...")
+                del params["where"]
+                data = self._get(self.EP_REFDOMAINS, params, timeout=300)
+                rows = data.get("refdomains", [])
 
-            domains = []
-            for r in rows:
-                cand = r.get("domain") or r.get("referring_domain") or r.get("host")
-                if cand:
-                    reg = extract_registrable_domain(cand)
-                    if reg:
-                        domains.append(reg)
-            unique_domains = sorted(set(domains))
-            st.success(f"✅ Fetched {len(unique_domains):,} baseline domains")
-            return unique_domains, f"/refdomains [{len(unique_domains):,} domains]"
         except requests.HTTPError as e:
-            st.error(f"❌ /refdomains failed: {str(e)[:200]}")
-            return [], f"/refdomains failed ({str(e)[:90]}…)"
+            error_msg = str(e)
+            if "400" in error_msg or "where" in error_msg.lower():
+                # where filter not supported on this endpoint — fall back to unfiltered
+                st.warning("⚠️ where filter not supported for /refdomains, fetching all...")
+                try:
+                    del params["where"]
+                    data = self._get(self.EP_REFDOMAINS, params, timeout=300)
+                    rows = data.get("refdomains", [])
+                except requests.HTTPError as e2:
+                    st.error(f"❌ /refdomains failed: {str(e2)[:200]}")
+                    return [], f"/refdomains failed ({str(e2)[:90]}…)"
+            else:
+                st.error(f"❌ /refdomains failed: {error_msg[:200]}")
+                return [], f"/refdomains failed ({error_msg[:90]}…)"
+
+        if not rows:
+            st.warning(f"⚠️ /refdomains returned 0 rows for `{target_clean}`")
+            return [], f"/refdomains returned 0 rows"
+
+        domains = []
+        for r in rows:
+            cand = r.get("domain") or r.get("referring_domain") or r.get("host")
+            if cand:
+                reg = extract_registrable_domain(cand)
+                if reg:
+                    domains.append(reg)
+        unique_domains = sorted(set(domains))
+        st.success(f"✅ Fetched {len(unique_domains):,} live baseline domains")
+        return unique_domains, f"/refdomains [{len(unique_domains):,} live domains]"
 
     def batch_get_domain_metrics(
         self,
