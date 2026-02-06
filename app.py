@@ -704,9 +704,9 @@ if test_api_btn and AHREFS_TOKEN:
             except Exception as e:
                 st.error(f"❌ Competitor test failed: {e}")
 
-    # Test 1c: Raw refdomains call to inspect response structure
-    st.write("### Test 1c: Raw Refdomains Response Structure")
-    with st.spinner("Testing /refdomains endpoint..."):
+    # Test 1c: Raw refdomains — check pagination keys
+    st.write("### Test 1c: Refdomains Pagination Check")
+    with st.spinner("Testing /refdomains pagination..."):
         try:
             params = {
                 "target": "ahrefs.com",
@@ -718,8 +718,28 @@ if test_api_btn and AHREFS_TOKEN:
             st.write(f"📤 GET {ah.BASE}{ah.EP_REFDOMAINS}")
             st.write(f"📤 Params: {params}")
             response = ah._get(ah.EP_REFDOMAINS, params)
-            st.write(f"📥 Response keys: **{list(response.keys())}**")
+            st.write(f"📥 **All response keys:** `{list(response.keys())}`")
             st.json(response)
+
+            # Test page 2 — if there's an offset or cursor key
+            has_cursor = any(k in response for k in ["next", "cursor", "next_cursor", "offset", "has_more"])
+            st.write(f"📥 Has pagination token: **{has_cursor}**")
+            if has_cursor:
+                for k in ["next", "cursor", "next_cursor", "offset", "has_more"]:
+                    if k in response:
+                        st.write(f"   • `{k}` = `{str(response[k])[:100]}`")
+
+            # Also test with offset param to see if offset-based pagination works
+            st.write("---")
+            st.write("📤 Testing with `offset=3` for page 2...")
+            params2 = params.copy()
+            params2["offset"] = 3
+            response2 = ah._get(ah.EP_REFDOMAINS, params2)
+            st.write(f"📥 Page 2 keys: `{list(response2.keys())}`")
+            page2_domains = response2.get("refdomains", [])
+            st.write(f"📥 Page 2 returned {len(page2_domains)} domains")
+            if page2_domains:
+                st.json(page2_domains)
         except Exception as e:
             st.error(f"❌ Refdomains test failed: {e}")
 
