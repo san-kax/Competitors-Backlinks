@@ -77,8 +77,8 @@ def make_session(pool_size: int = 100) -> requests.Session:
     """Create optimized HTTP session with connection pooling."""
     sess = requests.Session()
     retries = Retry(
-        total=5,
-        backoff_factor=0.3,
+        total=3,
+        backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
@@ -377,8 +377,11 @@ class AhrefsClient:
         Fetch new backlinks for a competitor using Ahrefs API v3.
 
         Uses /site-explorer/all-backlinks ordered by first_seen_link desc,
-        then filters client-side to only include backlinks within the date window.
-        (The v3 API does not have /new-backlinks or /new-refdomains endpoints.)
+        with a where filter to limit to recent backlinks server-side.
+        Falls back to client-side date filtering if where is not supported.
+
+        Credit optimization: starts with a small limit and only fetches more
+        if the entire batch is within the date window (meaning there may be more).
         """
         start_iso, end_iso = iso_window_last_n_days(days)
         start_date = start_iso[:10]  # YYYY-MM-DD
@@ -392,32 +395,71 @@ class AhrefsClient:
         target_clean = target_clean.rstrip("/")
 
         if show_debug:
-            st.write(f"🔍 {target_clean}: Calling API with params...")
+            st.write(f"🔍 {target_clean}: Fetching backlinks (window: {start_date})...")
+
+        # Try with server-side where filter first (saves credits if supported)
+        where_filter = f'gte(first_seen_link,"{start_date}")'
 
         try:
-            # Ahrefs has no hard cap on limit — fetch enough to cover the date window
             params = {
                 "target": target_clean,
                 "mode": "subdomains",
-                "limit": 50000,
+                "limit": 1000,
                 "output": "json",
                 "select": "url_from,first_seen_link",
                 "order_by": "first_seen_link:desc",
+                "where": where_filter,
             }
 
             data = self._get(self.EP_BACKLINKS, params, timeout=120)
             rows = data.get("backlinks", [])
 
             if show_debug:
-                st.info(f"📊 {target_clean}: /all-backlinks returned {len(rows)} backlinks")
+                st.info(f"📊 {target_clean}: where filter returned {len(rows)} backlinks")
+
+            # If we got exactly 1000, there may be more — fetch next batch
+            if len(rows) == 1000:
+                params["limit"] = 10000
+                data = self._get(self.EP_BACKLINKS, params, timeout=120)
+                rows = data.get("backlinks", [])
+                if show_debug:
+                    st.info(f"📊 {target_clean}: extended fetch returned {len(rows)} backlinks")
 
         except requests.HTTPError as e:
-            last_error = str(e)
-            if show_debug:
-                st.error(f"❌ {target_clean}: API call failed - {last_error[:150]}")
-            return []
+            error_msg = str(e)
+            # If where filter is not supported, fall back to order_by + client-side filtering
+            if "400" in error_msg or "where" in error_msg.lower():
+                if show_debug:
+                    st.warning(f"⚠️ {target_clean}: where filter not supported, using client-side filtering")
+                try:
+                    # Smart limit: estimate rows needed based on days
+                    # Typical site gets ~100-500 new backlinks/day, use 500/day as safe upper bound
+                    smart_limit = min(max(days * 500, 1000), 50000)
+                    params = {
+                        "target": target_clean,
+                        "mode": "subdomains",
+                        "limit": smart_limit,
+                        "output": "json",
+                        "select": "url_from,first_seen_link",
+                        "order_by": "first_seen_link:desc",
+                    }
 
-        # Filter to only backlinks within the date window
+                    data = self._get(self.EP_BACKLINKS, params, timeout=120)
+                    rows = data.get("backlinks", [])
+
+                    if show_debug:
+                        st.info(f"📊 {target_clean}: fallback returned {len(rows)} backlinks")
+                except requests.HTTPError as e2:
+                    if show_debug:
+                        st.error(f"❌ {target_clean}: API call failed - {str(e2)[:150]}")
+                    return []
+            else:
+                if show_debug:
+                    st.error(f"❌ {target_clean}: API call failed - {error_msg[:150]}")
+                return []
+
+        # Filter to only backlinks within the date window (needed for fallback path,
+        # harmless for where-filtered path)
         results = []
         for r in rows:
             url = r.get("url_from") or ""
@@ -431,7 +473,6 @@ class AhrefsClient:
 
             first_seen = r.get("first_seen_link") or ""
 
-            # Only include backlinks first seen within our date window
             if first_seen and len(first_seen) >= 10:
                 first_seen_date = first_seen[:10]
                 if first_seen_date >= start_date:
@@ -441,8 +482,7 @@ class AhrefsClient:
                         "domain": reg
                     })
                 else:
-                    # Since results are ordered by first_seen_link desc,
-                    # once we see a date before our window, we can stop
+                    # Results ordered desc — once we see older date, stop
                     break
 
         if show_debug:
@@ -708,52 +748,33 @@ if test_api_btn and AHREFS_TOKEN:
             except Exception as e:
                 st.error(f"❌ Competitor test failed: {e}")
 
-    # Test 1c: Raw refdomains — check pagination keys
-    st.write("### Test 1c: Refdomains Pagination Check")
-    with st.spinner("Testing /refdomains pagination..."):
+    # Test 1c: Refdomains endpoint (limit=1 to minimize credits)
+    st.write("### Test 1c: Refdomains Endpoint")
+    with st.spinner("Testing /refdomains endpoint..."):
         try:
             params = {
                 "target": "ahrefs.com",
                 "mode": "subdomains",
-                "limit": 3,
+                "limit": 1,
                 "output": "json",
                 "select": "domain",
             }
-            st.write(f"📤 GET {ah.BASE}{ah.EP_REFDOMAINS}")
-            st.write(f"📤 Params: {params}")
             response = ah._get(ah.EP_REFDOMAINS, params)
-            st.write(f"📥 **All response keys:** `{list(response.keys())}`")
-            st.json(response)
-
-            # Test page 2 — if there's an offset or cursor key
-            has_cursor = any(k in response for k in ["next", "cursor", "next_cursor", "offset", "has_more"])
-            st.write(f"📥 Has pagination token: **{has_cursor}**")
-            if has_cursor:
-                for k in ["next", "cursor", "next_cursor", "offset", "has_more"]:
-                    if k in response:
-                        st.write(f"   • `{k}` = `{str(response[k])[:100]}`")
-
-            # Also test with offset param to see if offset-based pagination works
-            st.write("---")
-            st.write("📤 Testing with `offset=3` for page 2...")
-            params2 = params.copy()
-            params2["offset"] = 3
-            response2 = ah._get(ah.EP_REFDOMAINS, params2)
-            st.write(f"📥 Page 2 keys: `{list(response2.keys())}`")
-            page2_domains = response2.get("refdomains", [])
-            st.write(f"📥 Page 2 returned {len(page2_domains)} domains")
-            if page2_domains:
-                st.json(page2_domains)
+            refdomains = response.get("refdomains", [])
+            if refdomains:
+                st.success(f"✅ /refdomains working (returned {len(refdomains)} domain)")
+            else:
+                st.warning("⚠️ /refdomains returned 0 rows")
         except Exception as e:
             st.error(f"❌ Refdomains test failed: {e}")
 
-    # Test 2: Backlinks fetch function
+    # Test 2: Backlinks fetch function (uses small window to minimize credits)
     st.write("### Test 2: Backlinks Fetch Function")
-    with st.spinner("Testing backlinks fetch..."):
+    with st.spinner("Testing backlinks fetch (3-day window)..."):
         try:
             test_target = "ahrefs.com"
-            test_results = ah.fetch_new_backlinks_raw(test_target, days=30, show_debug=True)
-            st.write(f"✅ Backlinks test: {len(test_results)} NEW backlinks for {test_target} (last 30 days)")
+            test_results = ah.fetch_new_backlinks_raw(test_target, days=3, show_debug=True)
+            st.write(f"✅ Backlinks test: {len(test_results)} NEW backlinks for {test_target} (last 3 days)")
             if test_results:
                 st.write(f"   First result: {test_results[0]}")
         except Exception as e:
