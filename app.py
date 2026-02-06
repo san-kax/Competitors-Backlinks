@@ -203,6 +203,8 @@ class AhrefsClient:
 
             if "backlinks" in data:
                 batch = data["backlinks"]
+            elif "refdomains" in data:
+                batch = data["refdomains"]
             elif "referring_domains" in data:
                 batch = data["referring_domains"]
             else:
