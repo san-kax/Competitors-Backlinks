@@ -702,6 +702,25 @@ if test_api_btn and AHREFS_TOKEN:
             except Exception as e:
                 st.error(f"❌ Competitor test failed: {e}")
 
+    # Test 1c: Raw refdomains call to inspect response structure
+    st.write("### Test 1c: Raw Refdomains Response Structure")
+    with st.spinner("Testing /refdomains endpoint..."):
+        try:
+            params = {
+                "target": "ahrefs.com",
+                "mode": "subdomains",
+                "limit": 3,
+                "output": "json",
+                "select": "domain",
+            }
+            st.write(f"📤 GET {ah.BASE}{ah.EP_REFDOMAINS}")
+            st.write(f"📤 Params: {params}")
+            response = ah._get(ah.EP_REFDOMAINS, params)
+            st.write(f"📥 Response keys: **{list(response.keys())}**")
+            st.json(response)
+        except Exception as e:
+            st.error(f"❌ Refdomains test failed: {e}")
+
     # Test 2: Backlinks fetch function
     st.write("### Test 2: Backlinks Fetch Function")
     with st.spinner("Testing backlinks fetch..."):
